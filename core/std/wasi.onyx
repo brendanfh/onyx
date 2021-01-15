@@ -22,6 +22,8 @@ package core
 #load "core/io/reader"
 #load "core/io/writer"
 
+#load "core/arg"
+
 #load "core/sys/wasi"
 
 

@@ -1,0 +1,73 @@
+package core.arg
+
+use package core
+
+Parser :: struct {
+    args         : [] cstr;
+    str_args     : [] str;
+    str_args_buf : ^str;
+
+    flags : [..] Flag;
+}
+
+#private_file
+Flag :: struct {
+    name        : str; // "-flag"
+    description : str;
+}
+
+make_parser :: proc (args: [] cstr) -> Parser {
+    parser: Parser;
+    parser.args = args;
+
+    parser.str_args_buf = cast(^str) calloc(sizeof str * args.count);
+    parser.str_args = parser.str_args_buf[0 .. args.count];
+    for i: 0 .. args.count {
+        parser.str_args[i] = string.make(args[i]);
+    }
+
+    array.init(^parser.flags, 2);
+
+    return parser;
+}
+
+free_parser :: proc (use parser: ^Parser) {
+    array.free(^parser.flags);
+    cfree(parser.str_args_buf);
+}
+
+required :: proc (use parser: ^Parser, name: str, result: ^$T, description := "No description provided.") -> ^Parser {
+    assert(false, "Required arguments are not supported");
+    return parser;
+}
+
+optional :: proc (use parser: ^Parser, name: str, result: ^$T, default: T, description := "No description provided.") -> ^Parser {
+    assert(false, "Optional arguments are not supported");
+    return parser;
+}
+
+flag :: proc (use parser: ^Parser, name: str, flag: ^bool, description := "No description provided.") -> ^Parser {
+    *flag = args_contains(str_args, name) != null;
+
+    array.push(^flags, Flag.{ name, description });
+    return parser;
+}
+
+
+parsing_successful :: proc (use parser: ^Parser) -> bool do return false; // nocheckin
+
+print_help :: proc (use parser: ^Parser) {
+    println("Supported flags:");
+    for flag: flags {
+        printf("    %s\n    %s\n\n", flag.name, flag.description);
+    }
+}
+
+#private_file
+args_contains :: proc (args: [] str, name: str) -> ^str {
+    for ^arg: args {
+        if *arg == name do return arg;
+    }
+
+    return null;
+}

@@ -1,0 +1,25 @@
+#load "core/std/wasi"
+
+use package core
+
+main :: proc (args: [] cstr) {
+    arg_parser := arg.make_parser(args);
+
+    // file_name : str;
+    // level     : u32;
+    // ^arg_parser
+    //     |> arg.required("-c",     ^file_name, description = "The file name.");
+    //     |> arg.optional("-level", ^level,     description = "Some kind of level.", default = 10);
+
+    flag_one: bool;
+    flag_two: bool;
+
+    ^arg_parser
+        |> arg.flag("-flag-one", ^flag_one, description = "Flag one is an incredibly useful parameter.")
+        |> arg.flag("-flag-two", ^flag_two, description = "Description for flag two.");
+
+    if !arg.parsing_successful(^arg_parser) {
+        arg.print_help(^arg_parser);
+        return;
+    }
+}
