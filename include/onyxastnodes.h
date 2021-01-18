@@ -474,7 +474,7 @@ struct AstUnaryOp       { AstTyped_base; UnaryOp operation; AstTyped *expr; };
 struct AstNumLit        { AstTyped_base; union { i32 i; i64 l; f32 f; f64 d; } value; };
 struct AstStrLit        { AstTyped_base; u64 addr; u64 length; };
 struct AstLocal         { AstTyped_base; };
-struct AstArgument      { AstTyped_base; AstTyped *value; VarArgKind va_kind; };
+struct AstArgument      { AstTyped_base; AstTyped *value; VarArgKind va_kind; b32 is_baked : 1; };
 struct AstAddressOf     { AstTyped_base; AstTyped *expr; };
 struct AstDereference   { AstTyped_base; AstTyped *expr; };
 struct AstArrayAccess   { AstTyped_base; AstTyped *addr; AstTyped *expr; u64 elem_size; };
@@ -748,6 +748,11 @@ struct AstFunction {
 
     OnyxToken* name;
 
+
+    // NOTE: This is NULL, unless this function was generated from a polymorphic
+    // procedure call. Then it is set to the token of the call node.
+    OnyxToken* generated_from;
+
     union {
         // NOTE: Used when a function is exported with a specific name
         OnyxToken* exported_name;
@@ -760,7 +765,42 @@ struct AstFunction {
         };
     };
 };
+
+struct AstOverloadedFunction {
+    AstTyped_base;
+
+    bh_arr(AstTyped *) overloads;
+};
+
+struct AstPackage {
+    AstNode_base;
+
+    Package* package;
+};
+
+//
+// Polymorphic procedures
+//
+
+typedef enum PolyParamKind {
+    // Dont love these names
+    PPK_Undefined,
+    PPK_Poly_Type,
+    PPK_Baked_Value,
+} PolyParamKind;
+
+typedef enum PolySolutionKind {
+    PSK_Undefined,
+    PSK_Type,
+    PSK_Value,
+} PolySolutionKind;
+
 struct AstPolyParam {
+    PolyParamKind kind;
+
+    // The parameter index where the polymorphic variable occurs.
+    u32 idx;
+
     // The symbol node that represents the polymorphic variable.
     AstNode* poly_sym;
 
@@ -770,15 +810,9 @@ struct AstPolyParam {
     // symbol.
     AstType* type_expr;
 
-    // The parameter index where the polymorphic variable occurs.
-    u64 idx;
+    // Used for baked values. The expected type of the parameter.
+    Type* type;
 };
-
-typedef enum PolySolutionKind {
-    PSK_Undefined,
-    PSK_Type,
-    PSK_Value,
-} PolySolutionKind;
 
 struct AstPolySolution {
     PolySolutionKind kind;
@@ -794,10 +828,12 @@ struct AstPolySolution {
         AstTyped* value;
     };
 };
+
 struct AstSolidifiedFunction {
     AstFunction* func;
     Scope*       poly_scope;
 };
+
 struct AstPolyProc {
     AstNode_base;
 
@@ -808,16 +844,6 @@ struct AstPolyProc {
 
     AstFunction* base_func;
     bh_table(AstSolidifiedFunction) concrete_funcs;
-};
-struct AstOverloadedFunction {
-    AstTyped_base;
-
-    bh_arr(AstTyped *) overloads;
-};
-struct AstPackage {
-    AstNode_base;
-
-    Package* package;
 };
 
 extern AstNode empty_node;
@@ -1003,15 +1029,18 @@ b32 fill_in_arguments(Arguments* args, AstNode* provider, char** err_msg);
 void arguments_ensure_length(Arguments* args, u32 count);
 void arguments_clone(Arguments* dest, Arguments* src);
 void arguments_deep_clone(bh_allocator a, Arguments* dest, Arguments* src);
+void arguments_remove_baked(Arguments* args);
+
+// GROSS: Using void* to avoid having to cast everything.
+const char* node_get_type_name(void* node);
 
 typedef enum PolyProcLookupMethod {
-    PPLM_By_Call,
-    PPLM_By_Function_Type,
     PPLM_By_Arguments,
+    PPLM_By_Function_Type,
 } PolyProcLookupMethod;
-AstFunction* polymorphic_proc_lookup(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual, OnyxFilePos pos);
-AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxFilePos pos);
-AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxFilePos pos);
+AstFunction* polymorphic_proc_lookup(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual, OnyxToken* tkn);
+AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxToken* tkn);
+AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxToken* tkn);
 AstFunction* polymorphic_proc_build_only_header(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual);
 
 

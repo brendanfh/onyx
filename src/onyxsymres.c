@@ -353,6 +353,11 @@ static void symres_array_literal(AstArrayLiteral* al) {
 }
 
 static void symres_expression(AstTyped** expr) {
+    if (node_is_type((AstNode *) *expr)) {
+        *((AstType **) expr) = symres_type((AstType *) *expr);
+        return;
+    }
+
     switch ((*expr)->kind) {
         case Ast_Kind_Symbol:
             *expr = (AstTyped *) symbol_resolve(semstate.curr_scope, ((AstNode *) *expr)->token);
@@ -565,7 +570,7 @@ static void symres_directive_solidify(AstDirectiveSolidify** psolid) {
         if (onyx_has_errors()) return;
     }
 
-    solid->resolved_proc = polymorphic_proc_try_solidify(solid->poly_proc, solid->known_polyvars, solid->token->pos);
+    solid->resolved_proc = polymorphic_proc_try_solidify(solid->poly_proc, solid->known_polyvars, solid->token);
 
     // NOTE: Not a DirectiveSolidify.
     *psolid = (AstDirectiveSolidify *) solid->resolved_proc;
@@ -848,6 +853,13 @@ static void symres_struct_defaults(AstType* t) {
 static void symres_polyproc(AstPolyProc* pp) {
     pp->poly_scope = semstate.curr_scope;
 
+    bh_arr_each(AstPolyParam, param, pp->poly_params) {
+        if (param->kind != PPK_Baked_Value) continue;
+
+        param->type_expr = symres_type(param->type_expr);
+    }
+
+    // CLEANUP: This was copied from symres_function_header.
     if (pp->base_func->operator_overload != (BinaryOp) -1) {
         if (bh_arr_length(pp->base_func->params) != 2) {
             onyx_report_error(pp->base_func->token->pos, "Expected 2 exactly arguments for binary operator overload.");

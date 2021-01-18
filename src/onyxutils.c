@@ -167,6 +167,7 @@ static void insert_poly_slns_into_scope(Scope* scope, bh_arr(AstPolySolution) sl
 
             case PSK_Value:
                 // CLEANUP: Maybe clone this?
+                assert(sln->value->flags & Ast_Flag_Comptime);
                 node = (AstNode *) sln->value;
                 break;
         }
@@ -353,7 +354,7 @@ static PolySolveResult solve_poly_type(AstNode* target, AstType* type_expr, Type
     return result;
 }
 
-static Type* lookup_actual_type_in_arguments(AstPolyProc* pp, AstPolyParam* param, Arguments* args, char** err_msg) {
+static AstTyped* lookup_param_in_arguments(AstPolyProc* pp, AstPolyParam* param, Arguments* args, char** err_msg) {
     bh_arr(AstTyped *) arg_arr = args->values;
     bh_arr(AstNamedValue *) named_values = args->named_values;
 
@@ -362,7 +363,7 @@ static Type* lookup_actual_type_in_arguments(AstPolyProc* pp, AstPolyParam* para
 
         bh_arr_each(AstNamedValue *, named_value, named_values) {
             if (token_equals(param_name, (*named_value)->token)) {
-                return resolve_expression_type((AstTyped *) (*named_value)->value);
+                return (AstTyped *) (*named_value)->value;
             }
         }
 
@@ -370,7 +371,7 @@ static Type* lookup_actual_type_in_arguments(AstPolyProc* pp, AstPolyParam* para
         if (err_msg) *err_msg = "Not enough arguments to polymorphic procedure. This error message may not be entirely right.";
 
     } else {
-        return resolve_expression_type((AstTyped *) arg_arr[param->idx]);
+        return (AstTyped *) arg_arr[param->idx];
     }
 
     return NULL;
@@ -392,46 +393,111 @@ static bh_arr(AstPolySolution) find_polymorphic_slns(AstPolyProc* pp, PolyProcLo
         }
         if (already_solved) continue;
 
-        Type* actual_type = NULL;
+        // CLEANUP CLEANUP CLEANUP
+        PolySolveResult resolved = { 0 };
 
-        if (pp_lookup == PPLM_By_Call) {
-            AstCall* call = (AstCall *) actual;
+        if (param->kind == PPK_Poly_Type) {
+            Type* actual_type = NULL;
 
-            actual_type = lookup_actual_type_in_arguments(pp, param, &call->args, err_msg);
-            if (actual_type == NULL) goto sln_not_found;
-        }
+            if (pp_lookup == PPLM_By_Arguments) {
+                Arguments* args = (Arguments *) actual;
 
-        else if (pp_lookup == PPLM_By_Arguments) {
-            Arguments* args = (Arguments *) actual;
+                AstTyped* typed_param = lookup_param_in_arguments(pp, param, args, err_msg);
+                if (typed_param == NULL) goto sln_not_found;
 
-            actual_type = lookup_actual_type_in_arguments(pp, param, args, err_msg);
-            if (actual_type == NULL) goto sln_not_found;
-        }
+                actual_type = resolve_expression_type(typed_param);
+                if (actual_type == NULL) goto sln_not_found;
+            }
 
-        else if (pp_lookup == PPLM_By_Function_Type) {
-            Type* ft = (Type*) actual;
-            if (param->idx >= ft->Function.param_count) {
-                if (err_msg) *err_msg = "Incompatible polymorphic argument to function parameter.";
+            else if (pp_lookup == PPLM_By_Function_Type) {
+                Type* ft = (Type*) actual;
+                if (param->idx >= ft->Function.param_count) {
+                    if (err_msg) *err_msg = "Incompatible polymorphic argument to function parameter.";
+                    goto sln_not_found;
+                }
+
+                actual_type = ft->Function.params[param->idx];
+            }
+
+            else {
+                if (err_msg) *err_msg = "Cannot resolve polymorphic function type.";
                 goto sln_not_found;
             }
 
-            actual_type = ft->Function.params[param->idx];
-        }
+            resolved = solve_poly_type(param->poly_sym, param->type_expr, actual_type);
 
-        else {
-            if (err_msg) *err_msg = "Cannot resolve polymorphic function type.";
-            goto sln_not_found;
-        }
+        } else if (param->kind == PPK_Baked_Value) {
+            AstTyped* value = NULL;
 
-        PolySolveResult resolved = solve_poly_type(param->poly_sym, param->type_expr, actual_type);
+            if (pp_lookup == PPLM_By_Arguments) {
+                Arguments* args = (Arguments *) actual;
+
+                value = lookup_param_in_arguments(pp, param, args, err_msg);
+                if (value == NULL) goto sln_not_found;
+            }
+
+            else if (pp_lookup == PPLM_By_Function_Type) {
+                *err_msg = "Function type cannot be used to solved for baked parameter value.";
+                goto sln_not_found;
+            }
+
+            else {
+                if (err_msg) *err_msg = "Cannot resolve polymorphic function type.";
+                goto sln_not_found;
+            }
+
+            AstTyped* orig_value = value;
+            if (value->kind == Ast_Kind_Argument) {
+                value = ((AstArgument *) value)->value;
+            }
+
+            if (param->type_expr == (AstType *) &type_expr_symbol) {
+                if (!node_is_type((AstNode *) value)) {
+                    *err_msg = "Expected type expression.";
+                    goto sln_not_found;
+                }
+
+                resolved = ((PolySolveResult) {
+                    .kind = PSK_Type,
+                    .actual = type_build_from_ast(semstate.node_allocator, (AstType *) value),
+                });
+
+            } else {
+                // CLEANUP
+                if ((value->flags & Ast_Flag_Comptime) == 0) {
+                    *err_msg = "Expected compile-time known argument.";
+                    goto sln_not_found;
+                }
+
+                if (param->type == NULL)
+                    param->type = type_build_from_ast(semstate.node_allocator, param->type_expr);
+
+                if (!type_check_or_auto_cast(&value, param->type)) {
+                    *err_msg = bh_aprintf(global_scratch_allocator,
+                            "The procedure '%s' expects a value of type '%s' for %d%s parameter, got '%s'.",
+                            get_function_name(pp->base_func),
+                            type_get_name(param->type),
+                            param->idx + 1,
+                            bh_num_suffix(param->idx + 1),
+                            node_get_type_name(value));
+                    goto sln_not_found;
+                }
+
+                resolved = ((PolySolveResult) { PSK_Value, value });
+            }
+
+            if (orig_value->kind == Ast_Kind_Argument) {
+                ((AstArgument *) orig_value)->is_baked = 1;
+            }
+        }
 
         switch (resolved.kind) {
             case PSK_Undefined:
                 if (err_msg) *err_msg = bh_aprintf(global_heap_allocator,
-                    "Unable to solve for polymoprhic variable '%b', using the type '%s'.",
+                    "Unable to solve for polymoprhic variable '%b'.",
                     param->poly_sym->token->text,
-                    param->poly_sym->token->length,
-                    type_get_name(actual_type));
+                    param->poly_sym->token->length);
+                    // type_get_name(actual_type));
                 goto sln_not_found;
 
             case PSK_Type:
@@ -459,17 +525,19 @@ sln_not_found:
     return NULL;
 }
 
-AstFunction* polymorphic_proc_lookup(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual, OnyxFilePos pos) {
+AstFunction* polymorphic_proc_lookup(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual, OnyxToken* tkn) {
     ensure_polyproc_cache_is_created(pp);
 
     char *err_msg = NULL;
     bh_arr(AstPolySolution) slns = find_polymorphic_slns(pp, pp_lookup, actual, &err_msg);
     if (slns == NULL) {
-        if (err_msg != NULL) onyx_report_error(pos, err_msg);
-        else                 onyx_report_error(pos, "Some kind of error occured when generating a polymorphic procedure. You hopefully will not see this");
+        if (err_msg != NULL) onyx_report_error(tkn->pos, err_msg);
+        else                 onyx_report_error(tkn->pos, "Some kind of error occured when generating a polymorphic procedure. You hopefully will not see this");
+
+        return NULL;
     }
 
-    AstFunction* result = polymorphic_proc_solidify(pp, slns, pos);
+    AstFunction* result = polymorphic_proc_solidify(pp, slns, tkn);
     
     bh_arr_free(slns);
     return result;
@@ -522,7 +590,7 @@ static char* build_poly_slns_unique_key(bh_arr(AstPolySolution) slns) {
     return key_buf;
 }
 
-b32 add_solidified_function_entities(AstSolidifiedFunction solidified_func, b32 header_already_processed) {
+static b32 add_solidified_function_entities(AstSolidifiedFunction solidified_func, b32 header_already_processed) {
     solidified_func.func->flags |= Ast_Flag_Function_Used;
     solidified_func.func->flags |= Ast_Flag_From_Polymorphism;
 
@@ -554,7 +622,7 @@ b32 add_solidified_function_entities(AstSolidifiedFunction solidified_func, b32 
     return 1;
 }
 
-AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxFilePos pos) {
+AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxToken* tkn) {
     ensure_polyproc_cache_is_created(pp);
 
     // NOTE: Check if a version of this polyproc has already been created.
@@ -566,7 +634,7 @@ AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) 
             clone_function_body(semstate.node_allocator, solidified_func.func, pp->base_func);
 
             if (!add_solidified_function_entities(solidified_func, 1)) {
-                onyx_report_error(pos, "Error in polymorphic procedure header generated from this call site.");
+                onyx_report_error(tkn->pos, "Error in polymorphic procedure header generated from this call site.");
                 return NULL;
             }
 
@@ -577,22 +645,34 @@ AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) 
     }
 
     AstSolidifiedFunction solidified_func;
-    solidified_func.poly_scope = scope_create(semstate.node_allocator, pp->poly_scope, pos);
+    solidified_func.poly_scope = scope_create(semstate.node_allocator, pp->poly_scope, tkn->pos);
     insert_poly_slns_into_scope(solidified_func.poly_scope, slns);
 
     solidified_func.func = (AstFunction *) ast_clone(semstate.node_allocator, pp->base_func);
     bh_table_put(AstSolidifiedFunction, pp->concrete_funcs, unique_key, solidified_func);
 
+    solidified_func.func->generated_from = tkn;
+
+    // HACK HACK HACK
+    u32 removed_params = 0;
+    bh_arr_each(AstPolyParam, param, pp->poly_params) {
+        if (param->kind != PPK_Baked_Value) continue;
+
+        bh_arr_deleten(solidified_func.func->params, param->idx - removed_params, 1);
+        removed_params++;
+    }
+
     if (!add_solidified_function_entities(solidified_func, 0)) {
-        onyx_report_error(pos, "Error in polymorphic procedure header generated from this call site.");
+        onyx_report_error(tkn->pos, "Error in polymorphic procedure header generated from this call site.");
         return NULL;
     }
+
     return solidified_func.func;
 }
 
 // NOTE: This can return either a AstFunction or an AstPolyProc, depending if enough parameters were
 // supplied to remove all the polymorphic variables from the function.
-AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxFilePos pos) {
+AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxToken* tkn) {
     i32 valid_argument_count = 0;
 
     bh_arr_each(AstPolySolution, sln, slns) {
@@ -608,7 +688,7 @@ AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) 
         if (found_match) {
             valid_argument_count++;
         } else {
-            onyx_report_error(pos, "'%b' is not a type variable of '%b'.",
+            onyx_report_error(tkn->pos, "'%b' is not a type variable of '%b'.",
                 sln->poly_sym->token->text, sln->poly_sym->token->length,
                 pp->token->text, pp->token->length);
             return (AstNode *) pp;
@@ -616,7 +696,7 @@ AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) 
     }
 
     if (valid_argument_count == bh_arr_length(pp->poly_params)) {
-        return (AstNode *) polymorphic_proc_solidify(pp, slns, pos);
+        return (AstNode *) polymorphic_proc_solidify(pp, slns, tkn);
 
     } else {
         // HACK: Some of these initializations assume that the entity for this polyproc has
@@ -664,6 +744,15 @@ AstFunction* polymorphic_proc_build_only_header(AstPolyProc* pp, PolyProcLookupM
     solidified_func.func = clone_function_header(semstate.node_allocator, pp->base_func);
     solidified_func.func->flags |= Ast_Flag_Incomplete_Body;
     solidified_func.func->flags |= Ast_Flag_From_Polymorphism;
+
+    // HACK HACK HACK
+    u32 removed_params = 0;
+    bh_arr_each(AstPolyParam, param, pp->poly_params) {
+        if (param->kind != PPK_Baked_Value) continue;
+
+        bh_arr_deleten(solidified_func.func->params, param->idx - removed_params, 1);
+        removed_params++;
+    }
 
     Entity func_header_entity = {
         .state = Entity_State_Resolve_Symbols,

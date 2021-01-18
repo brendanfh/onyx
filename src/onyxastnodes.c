@@ -414,8 +414,10 @@ b32 type_check_or_auto_cast(AstTyped** pnode, Type* type) {
     assert(type != NULL);
     assert(node != NULL);
 
+    if (node_is_type((AstNode *) node)) return 0;
+
     if (node->kind == Ast_Kind_Polymorphic_Proc) {
-        AstFunction* func = polymorphic_proc_lookup((AstPolyProc *) node, PPLM_By_Function_Type, type, node->token->pos);
+        AstFunction* func = polymorphic_proc_lookup((AstPolyProc *) node, PPLM_By_Function_Type, type, node->token);
         if (func == NULL) return 0;
 
         *pnode = (AstTyped *) func;
@@ -468,6 +470,10 @@ Type* resolve_expression_type(AstTyped* node) {
 
     if (node->kind == Ast_Kind_Argument) {
         node->type = resolve_expression_type(((AstArgument *) node)->value);
+    }
+
+    if (node_is_type((AstNode *) node)) {
+        return NULL;
     }
 
     if (node->type == NULL)
@@ -706,4 +712,37 @@ void arguments_deep_clone(bh_allocator a, Arguments* dest, Arguments* src) {
 
     bh_arr_each(AstTyped *, val, src->values)
         bh_arr_push(dest->values, (AstTyped *) ast_clone(a, (AstNode *) *val));
+}
+
+void arguments_remove_baked(Arguments* args) {
+    fori (i, 0, bh_arr_length(args->values)) {
+        if (args->values[i]->kind != Ast_Kind_Argument) continue;
+        if (!((AstArgument *) args->values[i])->is_baked) continue;
+
+        bh_arr_deleten(args->values, i, 1);
+        i--;
+    }
+
+    fori (i, 0, bh_arr_length(args->named_values)) {
+        if (args->named_values[i]->value->kind != Ast_Kind_Argument) continue;
+        if (!((AstArgument *) args->named_values[i]->value)->is_baked) continue;
+
+        bh_arr_deleten(args->named_values, i, 1);
+        i--;
+    }
+}
+
+// GROSS: Using void* to avoid having to cast everything.
+const char* node_get_type_name(void* node) {
+    if (node_is_type((AstNode *) node)) return "type_expr";
+
+    if (((AstNode *) node)->kind == Ast_Kind_Argument) {
+        return node_get_type_name(((AstArgument *) node)->value);
+    }
+
+    if (((AstNode *) node)->kind == Ast_Kind_Polymorphic_Proc) {
+        return "polymorphic procedure";
+    }
+
+    return type_get_name(((AstTyped *) node)->type);
 }
