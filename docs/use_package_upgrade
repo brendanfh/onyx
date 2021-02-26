@@ -1,0 +1,5 @@
+Plan of attack:
+    * Convert 'AstUse' to have the same abilities as 'AstUsePackage'
+    * Convert 'package ...' to properly parse into AstPackage
+    * 'package ...' at the top of a file introduces the package and all sub packages
+    * Remove 'AstUsePackage'. Keep Use Package entity, just as a 'AstUse'
