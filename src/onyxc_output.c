@@ -16,9 +16,23 @@ static char* BOILERPLATE_TOP =
     "typedef double   f64;\n"
     "typedef void    *rawptr;\n";
 
-
+static char* REGISTER_DEFINITION =
+    "typedef union Register {\n"
+    "    u8 u8;\n"
+    "    i8 i8;\n"
+    "    i16 i16;\n"
+    "    u16 u16;\n"
+    "    i32 i32;\n"
+    "    u32 u32;\n"
+    "    i64 i64;\n"
+    "    u64 u64;\n"
+    "    f32 f32;\n"
+    "    f64 f64;\n"
+    "    rawptr rawptr;\n"
+    "} Register;";
 
 
 void onyx_output_c_file(OnyxCFile* cfile, bh_file file) {
     bh_file_write(&file, BOILERPLATE_TOP, strlen(BOILERPLATE_TOP));
+    bh_file_write(&file, REGISTER_DEFINITION, strlen(REGISTER_DEFINITION));
 }
