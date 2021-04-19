@@ -29,10 +29,29 @@ static char* REGISTER_DEFINITION =
     "    f32 f32;\n"
     "    f64 f64;\n"
     "    rawptr rawptr;\n"
-    "} Register;";
+    "} Register;\n";
 
+static char* ENTRYPOINT =
+    "int main(int argc, char* argv[]) {\n"
+    "    puts(\"Nothing so far!\");\n"
+    "    return 0;\n"
+    "}\n";
 
-void onyx_output_c_file(OnyxCFile* cfile, bh_file file) {
+static void output_string_literals(OnyxCFile* c_file, bh_file file) {
+    bh_table_each_start(CStringLiteral, c_file->string_literals);
+        bh_fprintf(&file, "static const char __string%d[] = {", value.number);
+        fori (i, 0, value.size) {
+            bh_fprintf(&file, "%d,", (u32) value.data[i]);
+        }
+        bh_fprintf(&file, "0};\n");
+    bh_table_each_end;
+}
+
+void onyx_output_c_file(OnyxCFile* c_file, bh_file file) {
     bh_file_write(&file, BOILERPLATE_TOP, strlen(BOILERPLATE_TOP));
     bh_file_write(&file, REGISTER_DEFINITION, strlen(REGISTER_DEFINITION));
+
+    output_string_literals(c_file, file);
+
+    bh_file_write(&file, ENTRYPOINT, strlen(ENTRYPOINT));
 }

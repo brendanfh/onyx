@@ -7,7 +7,7 @@
 typedef struct CMemoryReservation {
     i32   number;
     i32   size;
-    char* initial_value;
+    void* initial_value;
 } CMemoryReservation;
 
 typedef struct CStringLiteral {
@@ -19,12 +19,15 @@ typedef struct CStringLiteral {
 typedef struct OnyxCFile {
     
     bh_arr(CMemoryReservation) memory_reservations;
-    bh_arr(CStringLiteral)     string_literals;
+
+    u32 next_string_literal_idx;
+    bh_table(CStringLiteral) string_literals;
+
 
 } OnyxCFile;
 
 
-void emit_c_entity(Entity* ent);
+OnyxCFile onyx_c_file_create(bh_allocator alloc);
 void onyx_output_c_file(OnyxCFile* cfile, bh_file file);
 
 #endif

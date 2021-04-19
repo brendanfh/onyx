@@ -180,6 +180,7 @@ static void context_init(CompileOptions* opts) {
     // context.wasm_module = bh_alloc_item(global_heap_allocator, OnyxWasmModule);
     // *context.wasm_module = onyx_wasm_module_create(global_heap_allocator);
     context.c_file = bh_alloc_item(global_heap_allocator, OnyxCFile);
+    *context.c_file = onyx_c_file_create(global_heap_allocator);
 
     entity_heap_init(&context.entities);
 
