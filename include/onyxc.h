@@ -16,12 +16,15 @@ typedef struct CStringLiteral {
     char* data;
 } CStringLiteral;
 
-typedef struct CFile {
+typedef struct OnyxCFile {
     
     bh_arr(CMemoryReservation) memory_reservations;
     bh_arr(CStringLiteral)     string_literals;
 
-} CFile;
+} OnyxCFile;
 
+
+void emit_c_entity(Entity* ent);
+void onyx_output_c_file(OnyxCFile* cfile, bh_file file);
 
 #endif

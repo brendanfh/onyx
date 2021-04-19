@@ -6,7 +6,7 @@
 #include "onyxerrors.h"
 #include "onyxparser.h"
 #include "onyxutils.h"
-#include "onyxwasm.h"
+#include "onyxc.h"
 #include "onyxdoc.h"
 
 #define VERSION "v0.1.0-beta"
@@ -37,7 +37,7 @@ static const char* docstring = "Onyx compiler version " VERSION "\n"
     "\n"
     "Flags:\n"
     "\t<input files>           List of initial files\n"
-    "\t-o <target_file>        Specify the target file (default: out.wasm)\n"
+    "\t-o <target_file>        Specify the target file (default: out.c)\n"
     "\t--runtime, -r <runtime> Specifies a runtime. Can be: wasi, js, custom.\n"
     "\t--verbose, -V           Verbose output\n"
     "\t           -VV          Very verbose output\n"
@@ -63,7 +63,7 @@ static CompileOptions compile_opts_parse(bh_allocator alloc, int argc, char *arg
         .runtime = Runtime_Wasi,
 
         .files = NULL,
-        .target_file = "out.wasm",
+        .target_file = "out.c",
     };
 
     bh_arr_new(alloc, options.files, 2);
@@ -177,8 +177,9 @@ static void context_init(CompileOptions* opts) {
     bh_arena_init(&context.ast_arena, global_heap_allocator, 16 * 1024 * 1024); // 16MB
     context.ast_alloc = bh_arena_allocator(&context.ast_arena);
 
-    context.wasm_module = bh_alloc_item(global_heap_allocator, OnyxWasmModule);
-    *context.wasm_module = onyx_wasm_module_create(global_heap_allocator);
+    // context.wasm_module = bh_alloc_item(global_heap_allocator, OnyxWasmModule);
+    // *context.wasm_module = onyx_wasm_module_create(global_heap_allocator);
+    context.c_file = bh_alloc_item(global_heap_allocator, OnyxCFile);
 
     entity_heap_init(&context.entities);
 
@@ -357,7 +358,7 @@ static b32 process_entity(Entity* ent) {
         case Entity_State_Comptime_Check_Types:
         case Entity_State_Check_Types:     check_entity(ent);  break;
         
-        case Entity_State_Code_Gen:        emit_entity(ent);   break;
+        case Entity_State_Code_Gen:        emit_c_entity(ent);   break;
     }
 
     return ent->state != before_state;
@@ -457,6 +458,13 @@ static i32 onyx_compile() {
         return ONYX_COMPILER_PROGRESS_FAILED_OUTPUT;
 
     if (context.options->verbose_output)
+        bh_printf("Outputting to C file:   %s\n", output_file.filename);
+
+    onyx_output_c_file(context.c_file, output_file);
+
+    return ONYX_COMPILER_PROGRESS_SUCCESS;
+#if 0
+    if (context.options->verbose_output)
         bh_printf("Outputting to WASM file:   %s\n", output_file.filename);
 
     onyx_wasm_module_write_to_file(context.wasm_module, output_file);
@@ -473,6 +481,7 @@ static i32 onyx_compile() {
     }
 
     return ONYX_COMPILER_PROGRESS_SUCCESS;
+#endif
 }
 
 int main(int argc, char *argv[]) {

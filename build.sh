@@ -7,7 +7,7 @@ sudo cp -r ./core/ "$CORE_DIR"
 
 [ "$1" = "libs_only" ] && exit 0
 
-C_FILES="onyx onyxastnodes onyxbuiltins onyxchecker onyxclone onyxdoc onyxentities onyxerrors onyxlex onyxparser onyxsymres onyxtypes onyxutils onyxwasm onyxc"
+C_FILES="onyx onyxastnodes onyxbuiltins onyxchecker onyxclone onyxdoc onyxentities onyxerrors onyxlex onyxparser onyxsymres onyxtypes onyxutils onyxc"
 TARGET='./bin/onyx'
 CC='gcc'
 

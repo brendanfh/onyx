@@ -1011,7 +1011,8 @@ void add_entities_for_node(bh_arr(Entity *)* target_arr, AstNode* node, Scope* s
 void entity_bring_to_state(Entity* ent, EntityState state);
 void symres_entity(Entity* ent);
 void check_entity(Entity* ent);
-void emit_entity(Entity* ent);
+void emit_c_entity(Entity* ent);
+// void emit_wasm_entity(Entity* ent);
 
 struct Package {
     char *name;
@@ -1077,7 +1078,10 @@ struct Context {
     bh_arr(bh_file_contents) loaded_files;
 
     // NOTE: This is defined in onyxwasm.h
-    struct OnyxWasmModule* wasm_module;
+    // struct OnyxWasmModule* wasm_module;
+    
+    // NOTE: This is defined in onyxc.h
+    struct OnyxCFile* c_file;
 
     b32 cycle_detected : 1;
 };

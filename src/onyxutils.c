@@ -1264,7 +1264,7 @@ void entity_bring_to_state(Entity* ent, EntityState state) {
         switch (ent->state) {
             case Entity_State_Resolve_Symbols: symres_entity(ent); break;
             case Entity_State_Check_Types:     check_entity(ent);  break;
-            case Entity_State_Code_Gen:        emit_entity(ent);   break;
+            case Entity_State_Code_Gen:        emit_c_entity(ent);   break;
 
             default: return;
         }
