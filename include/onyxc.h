@@ -7,7 +7,7 @@
 typedef struct CMemoryReservation {
     i32   number;
     i32   size;
-    void* initial_value;
+    u8 * initial_value;
 } CMemoryReservation;
 
 typedef struct CStringLiteral {

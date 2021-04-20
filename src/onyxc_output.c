@@ -40,6 +40,22 @@ static char* ENTRYPOINT =
     "    return 0;\n"
     "}\n\n";
 
+static void output_memory_reservations(OnyxCFile* c_file, bh_file file) {
+    bh_fprintf(&file, "// Memory reservations\n");
+    bh_arr_each(CMemoryReservation, value, c_file->memory_reservations) {
+        if (value->initial_value == NULL) {
+            bh_fprintf(&file, "static u8 __memory%d[%d] = { 0 };", value->number, value->size);
+        } else {
+            bh_fprintf(&file, "static u8 __memory%d[] = {", value->number);
+            fori (i, 0, value->size) {
+                bh_fprintf(&file, "%d,", (u32) value->initial_value[i]);
+            }
+            bh_fprintf(&file, "};");
+        }
+        bh_fprintf(&file, "\n");
+    }
+}
+
 static void output_string_literals(OnyxCFile* c_file, bh_file file) {
     bh_fprintf(&file, "// String Literals\n");
     bh_table_each_start(CStringLiteral, c_file->string_literals);
@@ -68,6 +84,7 @@ void onyx_output_c_file(OnyxCFile* c_file, bh_file file) {
     bh_file_write(&file, BOILERPLATE_TOP, strlen(BOILERPLATE_TOP));
     bh_file_write(&file, REGISTER_DEFINITION, strlen(REGISTER_DEFINITION));
 
+    output_memory_reservations(c_file, file);
     output_string_literals(c_file, file);
     output_file_contents(c_file, file);
 
