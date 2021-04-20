@@ -4,6 +4,8 @@
 static char* BOILERPLATE_TOP =
     "#include <stdlib.h>\n"
     "#include <stdint.h>\n"
+    "\n"
+    "// Base types\n"
     "typedef uint8_t  u8;\n"
     "typedef uint16_t u16;\n"
     "typedef uint32_t u32;\n"
@@ -14,9 +16,10 @@ static char* BOILERPLATE_TOP =
     "typedef int64_t  i64;\n"
     "typedef float    f32;\n"
     "typedef double   f64;\n"
-    "typedef void    *rawptr;\n";
+    "typedef void    *rawptr;\n\n";
 
 static char* REGISTER_DEFINITION =
+    "// The core Register type\n"
     "typedef union Register {\n"
     "    u8 u8;\n"
     "    i8 i8;\n"
@@ -29,15 +32,16 @@ static char* REGISTER_DEFINITION =
     "    f32 f32;\n"
     "    f64 f64;\n"
     "    rawptr rawptr;\n"
-    "} Register;\n";
+    "} Register;\n\n";
 
 static char* ENTRYPOINT =
     "int main(int argc, char* argv[]) {\n"
-    "    puts(\"Nothing so far!\");\n"
+    "    puts(__string1);\n"
     "    return 0;\n"
-    "}\n";
+    "}\n\n";
 
 static void output_string_literals(OnyxCFile* c_file, bh_file file) {
+    bh_fprintf(&file, "// String Literals\n");
     bh_table_each_start(CStringLiteral, c_file->string_literals);
         bh_fprintf(&file, "static const char __string%d[] = {", value.number);
         fori (i, 0, value.size) {
@@ -45,6 +49,19 @@ static void output_string_literals(OnyxCFile* c_file, bh_file file) {
         }
         bh_fprintf(&file, "0};\n");
     bh_table_each_end;
+    bh_fprintf(&file, "\n");
+}
+
+static void output_file_contents(OnyxCFile* c_file, bh_file file) {
+    bh_fprintf(&file, "// File Contents\n");
+    bh_table_each_start(LoadedFileInfo, c_file->loaded_file_info);
+        bh_fprintf(&file, "static const char __file_contents%d[] = {", value.number);
+        fori (i, 0, value.size) {
+            bh_fprintf(&file, "%d,", (u32) value.data[i]);
+        }
+        bh_fprintf(&file, "0};\n");
+    bh_table_each_end;
+    bh_fprintf(&file, "\n");
 }
 
 void onyx_output_c_file(OnyxCFile* c_file, bh_file file) {
@@ -52,6 +69,7 @@ void onyx_output_c_file(OnyxCFile* c_file, bh_file file) {
     bh_file_write(&file, REGISTER_DEFINITION, strlen(REGISTER_DEFINITION));
 
     output_string_literals(c_file, file);
+    output_file_contents(c_file, file);
 
     bh_file_write(&file, ENTRYPOINT, strlen(ENTRYPOINT));
 }

@@ -16,6 +16,12 @@ typedef struct CStringLiteral {
     char* data;
 } CStringLiteral;
 
+typedef struct LoadedFileInfo {
+    i32   number;
+    i32   size;
+    char* data;
+} LoadedFileInfo;
+
 typedef struct OnyxCFile {
     
     bh_arr(CMemoryReservation) memory_reservations;
@@ -23,6 +29,8 @@ typedef struct OnyxCFile {
     u32 next_string_literal_idx;
     bh_table(CStringLiteral) string_literals;
 
+    u32 next_file_contents_idx;
+    bh_table(LoadedFileInfo) loaded_file_info;
 
 } OnyxCFile;
 
