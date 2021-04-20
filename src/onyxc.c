@@ -36,6 +36,9 @@ static void emit_raw_data(OnyxCFile* c_file, ptr data, AstTyped* node) {
     case Ast_Kind_StrLit: {
         AstStrLit* sl = (AstStrLit *) node;
 
+        // :Incomplete this does not work because sl->addr is not the address in C.
+        // Need some way to encode &__stringXX
+        //
         // NOTE: This assumes the address and the length fields have been filled out
         // by emit_string_literal.
         u32* sdata = (u32 *) data;
@@ -53,7 +56,7 @@ static void emit_raw_data(OnyxCFile* c_file, ptr data, AstTyped* node) {
 
     case Ast_Kind_Function: {
         AstFunction* func = (AstFunction *) node;
-        *((u32 *) data) = 0; // :Imcomplete
+        *((u32 *) data) = 0; // :Incomplete
         break;
     }
 
