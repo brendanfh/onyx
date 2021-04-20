@@ -200,6 +200,8 @@ static void emit_file_contents(OnyxCFile* c_file, AstFileContents* fc) {
 
     fc->addr = lfi.number;
     fc->size = length - 1;
+
+    token_toggle_end(fc->filename);
 }
 
 void emit_c_entity(Entity *ent) {
