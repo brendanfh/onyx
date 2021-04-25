@@ -20,6 +20,7 @@
     NODE(Dereference)          \
     NODE(ArrayAccess)          \
     NODE(FieldAccess)          \
+    NODE(UnaryFieldAccess)     \
     NODE(SizeOf)               \
     NODE(AlignOf)              \
     NODE(FileContents)         \
@@ -152,6 +153,7 @@ typedef enum AstKind {
     Ast_Kind_Array_Access,
     Ast_Kind_Slice,
     Ast_Kind_Field_Access,
+    Ast_Kind_Unary_Field_Access,
     Ast_Kind_Pipe,
     Ast_Kind_Method_Call,
     Ast_Kind_Range_Literal,
@@ -501,6 +503,12 @@ struct AstFieldAccess   { AstTyped_base; AstTyped *expr; u32 offset; u32 idx; ch
 struct AstSizeOf        { AstTyped_base; AstType *so_ast_type; Type *so_type; u64 size; };
 struct AstAlignOf       { AstTyped_base; AstType *ao_ast_type; Type *ao_type; u64 alignment; };
 struct AstFileContents  { AstTyped_base; OnyxToken *filename; u32 addr, size; };
+struct AstUnaryFieldAccess {
+    AstTyped_base;
+
+    // "token" represents the field. This does not need an "offset" or an "index"
+    // because this node is meant to be replaced.
+};
 struct AstStructLiteral {
     AstTyped_base;
 
@@ -856,7 +864,9 @@ struct AstSolidifiedFunction {
 };
 
 struct AstPolyProc {
-    AstNode_base;
+    // While the "type" of a polymorphic procedure will never be set, it is necessary
+    // for contexts where it used in an expression.
+    AstTyped_base;
 
     Scope *poly_scope;
     bh_arr(AstPolyParam) poly_params;
@@ -900,8 +910,6 @@ struct AstDirectiveOperator {
     AstTyped *overload;
 };
 
-
-extern AstNode empty_node;
 
 typedef enum EntityState {
     Entity_State_Error,

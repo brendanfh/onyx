@@ -15,7 +15,7 @@ List of known bugs:
         println("Test 2");
     }
 
-[ ] Array literals used as default values for struct members can break things.
+[X] Array literals used as default values for struct members can break things.
     
     Foo :: struct {
         arr : [5] u32 = u32.[ 2, 3, 5, 7, 11 ];
@@ -64,6 +64,7 @@ List of known bugs:
         .{ -1, 0 }, .{ -1,  1 }, .{ 0,  1 }, 
     ];
 
+[ ] :UnaryFieldAccessIsGross
 
 List of things to change:
 [X] Currently, there is no way to use the initialized members of a structure without using a struct literal.
