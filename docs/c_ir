@@ -1,0 +1,16 @@
+A basic IR is going to be needed for the C compilation of Onyx. I've never done
+this before so the following are just some thoughts that have no proof of working.
+
+The IR instructions will be based on a 3 address code with an unlimited number
+of temporaries that will (probably) be allocated in a SSA form.
+
+Some of the IR instructions I think will be necessary:
+
+    - Immediate Load for different types
+    - Binary Operator 3 address code
+    - Unary Operator 2 address code
+    - Memory store for different types
+    - Memory load for different types
+    - Call
+    - Foreign Call
+
