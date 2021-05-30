@@ -1,6 +1,7 @@
 #include "bh.h"
 #include "onyxlex.h"
 #include "onyxutils.h"
+#include "onyxerrors.h"
 
 u64 lexer_lines_processed = 0;
 u64 lexer_tokens_processed = 0;
@@ -69,6 +70,8 @@ static const char* token_type_names[] = {
     "TOKEN_TYPE_LITERAL_FLOAT",
     "true",
     "false",
+
+    "NOTE"
 
     "TOKEN_TYPE_COUNT"
 };
@@ -210,6 +213,10 @@ whitespace_skipped:
         while (!(*tokenizer->curr == '"' && slash_count == 0)) {
             len++;
 
+            // if (*tokenizer->curr == '\n') {
+            //     onyx_report_error(tk.pos, "String literal not terminated by end of line.");
+            // }
+
             if (*tokenizer->curr == '\\') {
                 slash_count += 1;
                 slash_count %= 2;
@@ -241,6 +248,20 @@ whitespace_skipped:
         tk.type = Token_Type_Literal_Integer;
         tk.length = len;
 
+        INCREMENT_CURR_TOKEN(tokenizer);
+        goto token_parsed;
+    }
+
+    if (*tokenizer->curr == '@') {
+        INCREMENT_CURR_TOKEN(tokenizer);
+        u32 len = 2;
+        while (char_is_alphanum(*(tokenizer->curr + 1)) || *(tokenizer->curr + 1) == '_') {
+            len++;
+            INCREMENT_CURR_TOKEN(tokenizer);
+        }
+
+        tk.type = Token_Type_Note;
+        tk.length = len;
         INCREMENT_CURR_TOKEN(tokenizer);
         goto token_parsed;
     }

@@ -12,6 +12,7 @@
 #include "onyxutils.h"
 
 #define make_node(nclass, kind)             onyx_ast_node_new(parser->allocator, sizeof(nclass), kind)
+// :LinearTokenDependent
 #define peek_token(ahead)                   (parser->curr + ahead)
 
 static AstNode error_node = { Ast_Kind_Error, 0, NULL, NULL };
@@ -31,7 +32,6 @@ void submit_entity_in_scope(OnyxParser* parser, AstNode* node, Scope* scope, Pac
 
 // Parsing Utilities
 static void consume_token(OnyxParser* parser);
-static void unconsume_token(OnyxParser* parser);
 static OnyxToken* expect_token(OnyxParser* parser, TokenType token_type);
 static b32 consume_token_if_next(OnyxParser* parser, TokenType token_type);
 static b32 next_tokens_are(OnyxParser* parser, i32 n, ...);
@@ -64,6 +64,7 @@ static b32            parse_possible_function_definition(OnyxParser* parser, Ast
 static AstFunction*   parse_function_definition(OnyxParser* parser, OnyxToken* token);
 static AstTyped*      parse_global_declaration(OnyxParser* parser);
 static AstEnumType*   parse_enum_declaration(OnyxParser* parser);
+static AstStaticIf*   parse_static_if_stmt(OnyxParser* parser);
 static AstTyped*      parse_top_level_expression(OnyxParser* parser);
 static AstBinding*    parse_top_level_binding(OnyxParser* parser, OnyxToken* symbol);
 static void           parse_top_level_statement(OnyxParser* parser);
@@ -73,16 +74,10 @@ static void consume_token(OnyxParser* parser) {
     if (parser->hit_unexpected_token) return;
 
     parser->prev = parser->curr;
+    // :LinearTokenDependent
     parser->curr++;
-    while (parser->curr->type == Token_Type_Comment) parser->curr++;
-}
-
-static void unconsume_token(OnyxParser* parser) {
-    if (parser->hit_unexpected_token) return;
-
-    while (parser->prev->type == Token_Type_Comment) parser->prev--;
-    parser->curr = parser->prev;
-    parser->prev--;
+    while (parser->curr->type == Token_Type_Comment || parser->curr->type == Token_Type_Note)
+        parser->curr++;
 }
 
 static OnyxToken* find_matching_paren(OnyxToken* paren) {
@@ -98,6 +93,7 @@ static OnyxToken* find_matching_paren(OnyxToken* paren) {
     i32 paren_count = 1;
     i32 i = 1;
     while (paren_count > 0) {
+        // :LinearTokenDependent
         TokenType type = (paren + i)->type;
         if (type == Token_Type_End_Stream) return NULL;
 
@@ -107,6 +103,7 @@ static OnyxToken* find_matching_paren(OnyxToken* paren) {
         i++;
     }
 
+    // :LinearTokenDependent
     return paren + (i - 1);
 }
 
@@ -120,6 +117,7 @@ static OnyxToken* expect_token(OnyxParser* parser, TokenType token_type) {
     if (token->type != token_type) {
         onyx_report_error(token->pos, "expected token '%s', got '%s'.", token_name(token_type), token_name(token->type));
         parser->hit_unexpected_token = 1;
+        // :LinearTokenDependent
         parser->curr = &parser->tokenizer->tokens[bh_arr_length(parser->tokenizer->tokens) - 1];
         return NULL;
     }
@@ -148,6 +146,7 @@ static b32 next_tokens_are(OnyxParser* parser, i32 n, ...) {
 
     i32 matched = 1;
 
+    // BUG: This does not take into consideration comments and notes that can occur between any tokens.
     fori (i, 0, n) {
         TokenType expected_type = va_arg(va, TokenType);
         if (peek_token(i)->type != expected_type) {
@@ -212,16 +211,13 @@ static AstNumLit* parse_float_literal(OnyxParser* parser) {
 }
 
 static b32 parse_possible_directive(OnyxParser* parser, const char* dir) {
-    if (peek_token(0)->type != '#' || peek_token(1)->type != Token_Type_Symbol) return 0;
+    if (!next_tokens_are(parser, 2, '#', Token_Type_Symbol)) return 0;
 
-    expect_token(parser, '#');
-    OnyxToken* sym = expect_token(parser, Token_Type_Symbol);
+    OnyxToken* sym = peek_token(1);
 
     b32 match = (strlen(dir) == (u64) sym->length) && (strncmp(dir, sym->text, sym->length) == 0);
-    if (!match) {
-        unconsume_token(parser);
-        unconsume_token(parser);
-    }
+    if (match) consume_tokens(parser, 2);
+
     return match;
 }
 
@@ -490,7 +486,7 @@ static AstTyped* parse_factor(OnyxParser* parser) {
             if (parse_possible_directive(parser, "file_contents")) {
                 AstFileContents* fc = make_node(AstFileContents, Ast_Kind_File_Contents);
                 fc->token = parser->prev - 1;
-                fc->filename = expect_token(parser, Token_Type_Literal_String);
+                fc->filename_token = expect_token(parser, Token_Type_Literal_String);
                 fc->type = type_make_slice(parser->allocator, &basic_types[Basic_Kind_U8]);
                 
                 ENTITY_SUBMIT(fc);
@@ -1319,6 +1315,21 @@ static AstNode* parse_statement(OnyxParser* parser) {
                 retval = (AstNode *) context_tmp;
                 break;
             }
+
+            /*
+            This is in theory where the static if in procedures will be parsed. However,
+            this breaks many things because static if statements currently only parse top
+            level expressions in them, not general statements.
+
+            if (next_tokens_are(parser, 2, '#', Token_Type_Keyword_If)) {
+                AstStaticIf* static_if = parse_static_if_stmt(parser);
+                ENTITY_SUBMIT(static_if);
+
+                needs_semicolon = 0;
+                retval = (AstNode *) static_if;
+                break;
+            }
+            */
         }
 
         default:
@@ -1592,6 +1603,7 @@ static AstType* parse_type(OnyxParser* parser) {
             case '(': {
                 OnyxToken* matching = find_matching_paren(parser->curr);
 
+                // :LinearTokenDependent
                 if ((matching + 1)->type == Token_Type_Right_Arrow) {
                     *next_insertion = parse_function_type(parser, parser->curr);
 
@@ -1713,6 +1725,7 @@ static AstStructType* parse_struct(OnyxParser* parser) {
         } else {
             bh_arr_clear(member_list_temp);
             while (!consume_token_if_next(parser, ':')) {
+                if (parser->hit_unexpected_token) return NULL;
                 bh_arr_push(member_list_temp, expect_token(parser, Token_Type_Symbol));
 
                 if (parser->curr->type != ':')
@@ -1910,14 +1923,6 @@ static AstFunction* parse_function_definition(OnyxParser* parser, OnyxToken* tok
             func_def->flags |= Ast_Flag_Foreign;
         }
 
-        else if (parse_possible_directive(parser, "export")) {
-            func_def->flags |= Ast_Flag_Exported;
-
-            if (parser->curr->type == Token_Type_Literal_String) {
-                func_def->exported_name = expect_token(parser, Token_Type_Literal_String);
-            }
-        }
-
         // HACK: NullProcHack
         else if (parse_possible_directive(parser, "null")) {
             func_def->flags |= Ast_Flag_Proc_Is_Null;
@@ -1961,6 +1966,7 @@ static b32 parse_possible_function_definition(OnyxParser* parser, AstTyped** ret
         OnyxToken* matching_paren = find_matching_paren(parser->curr);
         if (matching_paren == NULL) return 0;
 
+        // :LinearTokenDependent
         OnyxToken* token_after_paren = matching_paren + 1;
         if (token_after_paren->type != Token_Type_Right_Arrow
             && token_after_paren->type != '{'
@@ -1968,6 +1974,7 @@ static b32 parse_possible_function_definition(OnyxParser* parser, AstTyped** ret
             && token_after_paren->type != Token_Type_Empty_Block)
             return 0;
 
+        // :LinearTokenDependent
         b32 is_params = (parser->curr + 1) == matching_paren;
         OnyxToken* tmp_token = parser->curr;
         while (!is_params && tmp_token < matching_paren) {
@@ -1997,14 +2004,6 @@ static AstTyped* parse_global_declaration(OnyxParser* parser) {
             global_node->foreign_name   = expect_token(parser, Token_Type_Literal_String);
 
             global_node->flags |= Ast_Flag_Foreign;
-        }
-
-        else if (parse_possible_directive(parser, "export")) {
-            global_node->flags |= Ast_Flag_Exported;
-
-            if (parser->curr->type == Token_Type_Literal_String) {
-                global_node->exported_name = expect_token(parser, Token_Type_Literal_String);
-            }
         }
 
         else {
@@ -2141,24 +2140,21 @@ static AstBinding* parse_top_level_binding(OnyxParser* parser, OnyxToken* symbol
     if (node->kind == Ast_Kind_Function) {
         AstFunction* func = (AstFunction *) node;
 
-        if (func->exported_name == NULL)
-            func->exported_name = symbol;
+        if (func->intrinsic_name == NULL)
+            func->intrinsic_name = symbol;
 
         func->name = symbol;
 
     } else if (node->kind == Ast_Kind_Polymorphic_Proc) {
         AstPolyProc* proc = (AstPolyProc *) node;
 
-        if (proc->base_func->exported_name == NULL)
-            proc->base_func->exported_name = symbol;
+        if (proc->base_func->intrinsic_name == NULL)
+            proc->base_func->intrinsic_name = symbol;
 
         proc->base_func->name = symbol;
 
     } else if (node->kind == Ast_Kind_Global) {
         AstGlobal* global = (AstGlobal *) node;
-
-        if (global->exported_name == NULL)
-            global->exported_name = symbol;
 
         global->name = symbol;
 
@@ -2308,6 +2304,16 @@ static void parse_top_level_statement(OnyxParser* parser) {
                 add_overload->overload = parse_expression(parser, 0);
 
                 ENTITY_SUBMIT(add_overload);
+                return;
+            }
+            else if (parse_possible_directive(parser, "export")) {
+                AstDirectiveExport *export = make_node(AstDirectiveExport, Ast_Kind_Directive_Export);
+                export->token = dir_token;
+                export->export_name = expect_token(parser, Token_Type_Literal_String);
+
+                export->export = parse_expression(parser, 0);
+
+                ENTITY_SUBMIT(export);
                 return;
             }
             else {

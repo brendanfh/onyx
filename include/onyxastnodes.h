@@ -34,6 +34,7 @@
     NODE(DirectiveError)       \
     NODE(DirectiveAddOverload) \
     NODE(DirectiveOperator)    \
+    NODE(DirectiveExport)      \
                                \
     NODE(Return)               \
     NODE(Jump)                 \
@@ -177,6 +178,7 @@ typedef enum AstKind {
     Ast_Kind_Directive_Error,
     Ast_Kind_Directive_Add_Overload,
     Ast_Kind_Directive_Operator,
+    Ast_Kind_Directive_Export,
 
     Ast_Kind_Count
 } AstKind;
@@ -502,7 +504,14 @@ struct AstArrayAccess   { AstTyped_base; AstTyped *addr; AstTyped *expr; u64 ele
 struct AstFieldAccess   { AstTyped_base; AstTyped *expr; u32 offset; u32 idx; char* field; }; // If token is null, defer to field
 struct AstSizeOf        { AstTyped_base; AstType *so_ast_type; Type *so_type; u64 size; };
 struct AstAlignOf       { AstTyped_base; AstType *ao_ast_type; Type *ao_type; u64 alignment; };
-struct AstFileContents  { AstTyped_base; OnyxToken *filename; u32 addr, size; };
+struct AstFileContents  {
+    AstTyped_base;
+
+    OnyxToken *filename_token;
+    char *filename; // The parsed file name, with '\' sequences removed and resolved to a particular file if possible.
+
+    u32 addr, size;
+};
 struct AstUnaryFieldAccess {
     AstTyped_base;
 
@@ -734,16 +743,8 @@ struct AstGlobal        {
 
     OnyxToken* name;
 
-    union {
-        // NOTE: Used when a global is exported with a specific name
-        OnyxToken* exported_name;
-
-        // NOTE: Used when the global is declared as foreign
-        struct {
-            OnyxToken* foreign_module;
-            OnyxToken* foreign_name;
-        };
-    };
+    OnyxToken* foreign_module;
+    OnyxToken* foreign_name;
 };
 struct AstParam {
     // HACK CLEANUP: This does not need to have a local buried inside of it.
@@ -771,9 +772,12 @@ struct AstFunction {
     // procedure call. Then it is set to the token of the call node.
     OnyxToken* generated_from;
 
+    // NOTE: This is NULL, unless this function is used in a "#export" directive.
+    // It is undefined which name it will have if there are multiple export directives
+    // for this particular function.
+    OnyxToken* exported_name;
+
     union {
-        // NOTE: Used when a function is exported with a specific name
-        OnyxToken* exported_name;
         OnyxToken* intrinsic_name;
 
         // NOTE: Used when the function is declared as foreign
@@ -910,6 +914,12 @@ struct AstDirectiveOperator {
     AstTyped *overload;
 };
 
+struct AstDirectiveExport {
+    AstNode_base;
+
+    OnyxToken* export_name;
+    AstTyped* export;
+};
 
 typedef enum EntityState {
     Entity_State_Error,

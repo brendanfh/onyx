@@ -338,6 +338,8 @@ EMIT_FUNC_NO_ARGS(leave_structured_block) {
 EMIT_FUNC(structured_jump, AstJump* jump) {
     bh_arr(WasmInstruction) code = *pcode;
 
+    // :CLEANUP These numbers should become constants because they are shared with
+    // enter_structured_block's definitions.
     static const u8 wants[Jump_Type_Count] = { 1, 2, 3 };
 
     u64 labelidx = 0;
@@ -359,7 +361,9 @@ EMIT_FUNC(structured_jump, AstJump* jump) {
 
     if (bh_arr_length(mod->deferred_stmts) != 0) {
         i32 i = bh_arr_length(mod->deferred_stmts) - 1;
-        while (i >= 0 && mod->deferred_stmts[i].depth >= labelidx) {
+        i32 d = bh_arr_length(mod->structured_jump_target) - (labelidx + 1);
+
+        while (i >= 0 && (i32) mod->deferred_stmts[i].depth > d) {
             emit_deferred_stmt(mod, &code, mod->deferred_stmts[i]);
             i--;
         }
@@ -2756,19 +2760,6 @@ static void emit_function(OnyxWasmModule* mod, AstFunction* fd) {
 
     i32 func_idx = (i32) bh_imap_get(&mod->index_map, (u64) fd);
 
-    if (fd->flags & Ast_Flag_Exported) {
-        token_toggle_end(fd->exported_name);
-
-        WasmExport wasm_export = {
-            .kind = WASM_FOREIGN_FUNCTION,
-            .idx = func_idx,
-        };
-        bh_table_put(WasmExport, mod->exports, fd->exported_name->text, wasm_export);
-        mod->export_count++;
-
-        token_toggle_end(fd->exported_name);
-    }
-
     // If there is no body then don't process the code
     if (fd->body != NULL) {
         // NOTE: Generate the local map
@@ -2853,6 +2844,32 @@ static void emit_foreign_function(OnyxWasmModule* mod, AstFunction* fd) {
     return;
 }
 
+static void emit_export_directive(OnyxWasmModule* mod, AstDirectiveExport* export) {
+    assert(export->export_name);
+    assert(export->export);
+
+    token_toggle_end(export->export_name);
+
+    i64 idx = bh_imap_get(&mod->index_map, (u64) export->export);
+
+    WasmExport wasm_export;
+    wasm_export.idx = (i32) idx;
+
+    switch (export->export->kind) {
+        case Ast_Kind_Function: wasm_export.kind = WASM_FOREIGN_FUNCTION;
+                                break;
+
+        case Ast_Kind_Global:   wasm_export.kind = WASM_FOREIGN_GLOBAL;
+                                break;
+    }
+
+    bh_table_put(WasmExport, mod->exports, export->export_name->text, wasm_export);
+    mod->export_count++;
+    
+    token_toggle_end(export->export_name);
+    return;
+}
+
 static void emit_global(OnyxWasmModule* module, AstGlobal* global) {
     WasmType global_type = onyx_type_to_wasm_type(global->type);
 
@@ -2863,19 +2880,6 @@ static void emit_global(OnyxWasmModule* module, AstGlobal* global) {
     };
 
     i32 global_idx = (i32) bh_imap_get(&module->index_map, (u64) global);
-
-    if ((global->flags & Ast_Flag_Exported) != 0) {
-        token_toggle_end(global->exported_name);
-
-        WasmExport wasm_export = {
-            .kind = WASM_FOREIGN_GLOBAL,
-            .idx = global_idx,
-        };
-        bh_table_put(WasmExport, module->exports, global->exported_name->text, wasm_export);
-        module->export_count++;
-
-        token_toggle_end(global->exported_name);
-    }
 
     bh_arr_new(global_heap_allocator, glob.initial_value, 1);
 
@@ -3077,37 +3081,55 @@ static void emit_memory_reservation(OnyxWasmModule* mod, AstMemRes* memres) {
 }
 
 static void emit_file_contents(OnyxWasmModule* mod, AstFileContents* fc) {
-    token_toggle_end(fc->filename);
+    token_toggle_end(fc->filename_token);
 
-    if (bh_table_has(StrLitInfo, mod->loaded_file_info, fc->filename->text)) {
-        StrLitInfo info = bh_table_get(StrLitInfo, mod->loaded_file_info, fc->filename->text);
+    // INVESTIGATE: I think that filename should always be NULL when this function starts because
+    // a file contents entity is only processed once and therefore should only go through this step
+    // once. But somehow filename isn't NULL occasionally so I have to check for that...
+    //                                                                      - brendanfh  2021/05/23
+    if (fc->filename == NULL) {
+        const char* parent_file = fc->token->pos.filename;
+        if (parent_file == NULL) parent_file = ".";
+
+        char* parent_folder = bh_path_get_parent(parent_file, global_scratch_allocator);
+
+        char* temp_fn     = bh_alloc_array(global_scratch_allocator, char, fc->filename_token->length);
+        i32   temp_fn_len = string_process_escape_seqs(temp_fn, fc->filename_token->text, fc->filename_token->length);
+        char* filename    = lookup_included_file(temp_fn, parent_folder, 0, 0);
+        fc->filename      = bh_strdup(global_heap_allocator, filename);
+    }
+
+    token_toggle_end(fc->filename_token);
+
+    if (bh_table_has(StrLitInfo, mod->loaded_file_info, fc->filename)) {
+        StrLitInfo info = bh_table_get(StrLitInfo, mod->loaded_file_info, fc->filename);
         fc->addr = info.addr;
         fc->size = info.len;
-
-        token_toggle_end(fc->filename);
         return;
     }
 
     u32 offset = mod->next_datum_offset;
     bh_align(offset, 16);
 
-    if (!bh_file_exists(fc->filename->text)) {
-        onyx_report_error(fc->filename->pos,
+    if (!bh_file_exists(fc->filename)) {
+        onyx_report_error(fc->filename_token->pos,
                 "Unable to open file for reading, '%s'.",
-                fc->filename->text);
-
-        token_toggle_end(fc->filename);
+                fc->filename);
         return;
     }
 
-    bh_file_contents contents = bh_file_read_contents(global_heap_allocator, fc->filename->text);
+    // :RelativeFiles This should be relative to the current directory by default; However,
+    // if the filename is prefixed with a './' or '.\\' then it should be relative to the
+    // file in which is was inclded. The loaded file info above should probably use the full
+    // file path in order to avoid duplicates.
+    bh_file_contents contents = bh_file_read_contents(global_heap_allocator, fc->filename);
     u8* actual_data = bh_alloc(global_heap_allocator, contents.length + 1);
     u32 length = contents.length + 1;
     memcpy(actual_data, contents.data, contents.length);
     actual_data[contents.length] = 0;
     bh_file_contents_free(&contents);
 
-    bh_table_put(StrLitInfo, mod->loaded_file_info, fc->filename->text, ((StrLitInfo) {
+    bh_table_put(StrLitInfo, mod->loaded_file_info, fc->filename, ((StrLitInfo) {
         .addr = offset,
         .len  = length - 1,
     }));
@@ -3124,8 +3146,6 @@ static void emit_file_contents(OnyxWasmModule* mod, AstFileContents* fc) {
     bh_arr_push(mod->data, datum);
 
     mod->next_datum_offset = offset + length;
-
-    token_toggle_end(fc->filename);
 }
 
 OnyxWasmModule onyx_wasm_module_create(bh_allocator alloc) {
@@ -3271,6 +3291,13 @@ void emit_entity(Entity* ent) {
 
         case Entity_Type_Memory_Reservation: {
             emit_memory_reservation(module, (AstMemRes *) ent->mem_res);
+            break;
+        }
+
+        case Entity_Type_Process_Directive: {
+            if (ent->expr->kind == Ast_Kind_Directive_Export) {
+                emit_export_directive(module, (AstDirectiveExport *) ent->expr);
+            }
             break;
         }
 

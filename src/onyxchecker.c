@@ -62,7 +62,9 @@ static inline void fill_in_array_count(AstType* type_node) {
 
     if (type_node->kind == Ast_Kind_Array_Type) {
         if (((AstArrayType *) type_node)->count_expr) {
+            // CLEANUP: The return value is not checked on this call.
             check_expression(&((AstArrayType *) type_node)->count_expr);
+
             resolve_expression_type(((AstArrayType *) type_node)->count_expr);
         }
     }
@@ -76,7 +78,9 @@ static inline void fill_in_poly_call_args(AstType* type_node) {
 
     bh_arr_each(AstNode *, param, pctype->params) {
         if (!node_is_type(*param)) {
+            // CLEANUP: The return value is not checked on this call.
             check_expression((AstTyped **) param);
+            
             resolve_expression_type((AstTyped *) *param);
             fill_in_type((AstTyped *) *param);
         }
@@ -530,6 +534,11 @@ CheckStatus check_call(AstCall* call) {
                 if (arg_pos >= (u32) bh_arr_length(arg_arr)) goto type_checking_done;
 
                 resolve_expression_type(arg_arr[arg_pos]->value);
+                if (arg_arr[arg_pos]->value->type == NULL) {
+                    onyx_report_error(arg_arr[arg_pos]->token->pos, "Unable to resolve type for argument.");
+                    return Check_Error;
+                }
+
                 arg_arr[arg_pos]->va_kind = VA_Kind_Untyped;
                 break;
             }
@@ -957,6 +966,10 @@ CheckStatus check_unaryop(AstUnaryOp** punop) {
 
 CheckStatus check_struct_literal(AstStructLiteral* sl) {
     if (sl->type == NULL) {
+        // NOTE: This is used for automatically typed struct literals. If there is no provided
+        // type for the struct literal, assume that it is passes successfully. When it is used
+        // elsewhere, it will be added as an expression entity that will be processed once the
+        // stnode is filled out.
         if (sl->stnode == NULL) return Check_Success;
 
         if (!node_is_type((AstNode *) sl->stnode)) {
@@ -1001,6 +1014,9 @@ CheckStatus check_struct_literal(AstStructLiteral* sl) {
     AstTyped** actual = sl->args.values;
     StructMember smem;
 
+    // BUG: There are problems setting the comptime flag this late in the checking because
+    // if the struct literal was type inferred, then the literal won't be correctly determined
+    // to be comptime on the first pass, which is needed for top level expressions.
     sl->flags |= Ast_Flag_Comptime;
 
     fori (i, 0, mem_count) {
@@ -1456,10 +1472,7 @@ CheckStatus check_global(AstGlobal* global) {
     fill_in_type((AstTyped *) global);
 
     if (global->type == NULL) {
-        onyx_report_error(global->token->pos,
-                "Unable to resolve type for global '%b'.",
-                global->exported_name->text,
-                global->exported_name->length);
+        onyx_report_error(global->token->pos, "Unable to resolve type for global.");
 
         return Check_Error;
     }
@@ -1491,7 +1504,9 @@ CheckStatus check_statement(AstNode** pstmt) {
         // in a block in order to efficiently allocate enough space and registers
         // for them all. Now with LocalAllocator, this is no longer necessary.
         // Therefore, locals stay in the tree and need to be passed along.
-        case Ast_Kind_Local: return Check_Success;
+        case Ast_Kind_Local:
+            fill_in_type((AstTyped *) stmt);
+            return Check_Success;
 
         default:
             CHECK(expression, (AstTyped **) pstmt);
@@ -1709,6 +1724,8 @@ CheckStatus check_function_header(AstFunction* func) {
 
     func->type = type_build_function_type(context.ast_alloc, func);
 
+    /*
+    CLEANUP: These checks need to be ported to a process directive check.
     if ((func->flags & Ast_Flag_Exported) != 0) {
         if ((func->flags & Ast_Flag_Foreign) != 0) {
             onyx_report_error(func->token->pos, "exporting a foreign function");
@@ -1725,6 +1742,7 @@ CheckStatus check_function_header(AstFunction* func) {
             return Check_Error;
         }
     }
+    */
 
     return Check_Success;
 }

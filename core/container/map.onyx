@@ -1,7 +1,8 @@
 package core.map
 
 #private_file array  :: package core.array
-#private_file string :: package core.string
+#private_file hash   :: package core.hash
+use package core.intrinsics.onyx { __zero_value }
 
 Map :: struct (K: type_expr, V: type_expr) {
     hashes  : [..] i32;
@@ -17,7 +18,7 @@ Map :: struct (K: type_expr, V: type_expr) {
     }
 }
 
-make :: ($Key: type_expr, $Value: type_expr, default: Value = 0, hash_count: i32 = 16) -> Map(Key, Value) {
+make :: ($Key: type_expr, $Value: type_expr, default := __zero_value(Value), hash_count: i32 = 16) -> Map(Key, Value) {
     map : Map(Key, Value);
     init(^map, default = default, hash_count = hash_count);
     return map;
@@ -107,26 +108,6 @@ empty :: (use map: ^Map($K, $V)) -> bool {
     return entries.count == 0;
 }
 
-hash_function :: proc {
-    (key: rawptr) -> u32 { return 0xcbf29ce7 ^ cast(u32) key; },
-    (key: i32)    -> u32 { return 0xcbf29ce7 ^ cast(u32) key; },
-    (key: i64)    -> u32 { return cast(u32) (cast(u64) 0xcbf29ce7 ^ cast(u64) key); },
-    (key: str)    -> u32 {
-        hash: u32 = 5381;
-        for ch: key do hash += (hash << 5) + ~~ch;
-        return hash;
-    },
-}
-
-// CLEANUP: This could be replaced with operator overloading of '=='
-cmp_function :: proc {
-    (a: rawptr, b: rawptr) -> bool { return a == b; },
-    (a: i32, b: i32) -> bool       { return a == b; },
-    (a: i64, b: i64) -> bool       { return a == b; },
-
-    string.equal,
-}
-
 //
 // Private symbols
 //
@@ -142,13 +123,13 @@ MapLookupResult :: struct {
 lookup :: (use map: ^Map($K, $V), key: K) -> MapLookupResult {
     lr := MapLookupResult.{};
 
-    hash: u32 = hash_function(key); // You cannot use this type for the key, unless you add an overload.
+    hash_value: u32 = hash.to_u32(key); // You cannot use this type for the key, unless you add an overload.
 
-    lr.hash_index = hash % hashes.count;
+    lr.hash_index = hash_value % hashes.count;
     lr.entry_index = hashes[lr.hash_index];
 
     while lr.entry_index >= 0 {
-        if cmp_function(entries[lr.entry_index].key, key) do return lr;
+        if entries[lr.entry_index].key == key do return lr;
 
         lr.entry_prev = lr.entry_index;
         lr.entry_index = entries[lr.entry_index].next;

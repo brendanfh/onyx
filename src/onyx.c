@@ -208,44 +208,6 @@ static void context_free() {
     compile_opts_free(context.options);
 }
 
-// NOTE: This should not be called until immediately before using the return value.
-// This function can return a static variable which will change if this is called
-// another time.                                        -brendanfh 2020/10/09
-static char* lookup_included_file(char* filename) {
-    static char path[256];
-    fori (i, 0, 256) path[i] = 0;
-
-    static char fn[128];
-    fori (i, 0, 128) fn[i] = 0;
-
-    if (!bh_str_ends_with(filename, ".onyx")) {
-        bh_snprintf(fn, 128, "%s.onyx", filename);
-    } else {
-        bh_snprintf(fn, 128, "%s", filename);
-    }
-
-#if defined(_BH_LINUX)
-    #define DIR_SEPARATOR '/'
-#elif defined(_BH_WINDOWS)
-    #define DIR_SEPARATOR '\\'
-#endif
-
-    fori (i, 0, 128) if (fn[i] == '/') fn[i] = DIR_SEPARATOR;
-
-    bh_arr_each(const char *, folder, context.options->included_folders) {
-        if ((*folder)[strlen(*folder) - 1] != DIR_SEPARATOR)
-            bh_snprintf(path, 256, "%s%c%s", *folder, DIR_SEPARATOR, fn);
-        else
-            bh_snprintf(path, 256, "%s%s", *folder, fn);
-
-        if (bh_file_exists(path)) return path;
-    }
-
-    return fn;
-
-#undef DIR_SEPARATOR
-}
-
 static void parse_source_file(bh_file_contents* file_contents) {
     // :Remove passing the allocators as parameters
     OnyxTokenizer tokenizer = onyx_tokenizer_create(context.token_alloc, file_contents);
@@ -258,9 +220,8 @@ static void parse_source_file(bh_file_contents* file_contents) {
 
 static void process_source_file(char* filename, OnyxFilePos error_pos) {
     bh_arr_each(bh_file_contents, fc, context.loaded_files) {
-        // CLEANUP: Add duplicate resolutions, such as
-        //          ./foo and ./test/../foo
-        // should be the same thing.
+        // Duplicates are detected here and since these filenames will be the full path,
+        // string comparing them should be all that is necessary.
         if (!strcmp(fc->filename, filename)) return;
     }
 
@@ -287,7 +248,13 @@ static void process_load_entity(Entity* ent) {
     AstInclude* include = ent->include;
 
     if (include->kind == Ast_Kind_Load_File) {
-        char* filename = lookup_included_file(include->name);
+        // :RelativeFiles
+        const char* parent_file = include->token->pos.filename;
+        if (parent_file == NULL) parent_file = ".";
+
+        char* parent_folder = bh_path_get_parent(parent_file, global_scratch_allocator);
+        
+        char* filename = lookup_included_file(include->name, parent_folder, 1, 1);
         char* formatted_name = bh_strdup(global_heap_allocator, filename);
 
         process_source_file(formatted_name, include->token->pos);

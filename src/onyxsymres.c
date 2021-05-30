@@ -991,6 +991,12 @@ static SymresStatus symres_polyproc(AstPolyProc* pp) {
     bh_arr_each(AstPolyParam, param, pp->poly_params) {
         if (param->kind != PPK_Baked_Value) continue;
 
+        // FIX: Looking up symbols immediately in the type of the baked value does not always work
+        // because I think the following should be possible:
+        //
+        //     baked_proc :: (x: $T, $f: (T) -> T) -> T ...
+        // 
+        // The type of 'f' depends on resolving the value for the polyvar 'T'.
         SYMRES(type, &param->type_expr);
     }
 
@@ -1043,6 +1049,20 @@ static SymresStatus symres_process_directive(AstNode* directive) {
             }
 
             bh_arr_push(operator_overloads[operator->operator], operator->overload);
+            break;
+        }
+
+        case Ast_Kind_Directive_Export: {
+            AstDirectiveExport *export = (AstDirectiveExport *) directive;
+            SYMRES(expression, &export->export);
+
+            export->export->flags |= Ast_Flag_Exported;
+
+            if (export->export->kind == Ast_Kind_Function) {
+                AstFunction *func = (AstFunction *) export->export;
+                func->exported_name = export->export_name;
+            }
+
             break;
         }
     }
@@ -1109,7 +1129,6 @@ void symres_entity(Entity* ent) {
         case Entity_Type_String_Literal:          ss = symres_expression(&ent->expr); break;
         case Entity_Type_Struct_Member_Default:   ss = symres_struct_defaults((AstType *) ent->type_alias); break;
         case Entity_Type_Process_Directive:       ss = symres_process_directive((AstNode *) ent->expr);
-                                                  next_state = Entity_State_Finalized;
                                                   break;
 
         default: break;

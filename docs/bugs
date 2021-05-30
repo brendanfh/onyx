@@ -1,5 +1,48 @@
 List of known bugs:
 
+[ ] Compound assignment operators such as += evaluate the location of their left-value twice.
+    Not only is this bad for efficiency, if the value requires calling a function, that
+    function will be called twice instead of once. This is a simple code generation fix,
+    but will require not destroying this information in the checking phase of the compiler.
+
+[ ] This currently does not work but I think it should:
+
+    baked_proc :: (x: $T, $func: (T) -> T) -> T {
+        return func(x);
+    }
+
+    The problem is that 'T' is an unresolved symbol because the context of the function type
+    does not have the solved value of T in it.
+
+[ ] Top level implicit typed arrays/struct literals are not correctly being marked as compile-time.
+
+    Vec2 :: struct { x, y: i32; }
+    
+    Hex_Directions := Vec2.[
+        .{  1, 0 }, .{  1, -1 }, .{ 0, -1 }, 
+        .{ -1, 0 }, .{ -1,  1 }, .{ 0,  1 }, 
+    ];
+
+[ ] :UnaryFieldAccessIsGross
+
+[ ] Segfault when trying to immediately access type inferred array literal.
+    println( (.[ 1, 2, 3, 4, 5 ])[0] );
+
+[ ] Why are character literals signed????
+
+[ ] Aliasing in many cases does not work. For example:
+    
+    SomeNamespace :: struct {
+        foo :: () { ... }
+        bar :: ...
+    }
+
+    {
+        SN :: SomeNamespace
+
+        SN.foo()
+    }
+
 [X] Enum parsing causes segfaults if the syntax is not EXACTLY what is expected. Some cases that break:
     enum { Foo, Bar, Baz };
     enum { Foo; Bar; Baz };
@@ -23,20 +66,7 @@ List of known bugs:
 
     foo := Foo.{};        OR          foo := new(Foo);
 
-[ ] Aliasing in many cases does not work. For example:
-    
-    SomeNamespace :: struct {
-        foo :: () { ... }
-        bar :: ...
-    }
-
-    {
-        SN :: SomeNamespace
-
-        SN.foo()
-    }
-
-[ ] There is a segfault when passing an anonymous struct literal to an untyped vararg.
+[X] There is a segfault when passing an anonymous struct literal to an untyped vararg.
     Should just need to detect this case and provide an error message since this doesn't
     make any sense semantically.
     
@@ -46,25 +76,8 @@ List of known bugs:
 
     vararg_proc(.{ 1, 2 });
 
-[ ] This currently does not work but I think it should:
 
-    baked_proc :: (x: $T, $func: (T) -> T) -> T {
-        return func(x);
-    }
-
-    The problem is that 'T' is an unresolved symbol because the context of the function type
-    does not have the solved value of T in it.
-
-[ ] Top level implicit typed arrays/struct literals are not correctly being marked as compile-time.
-
-    Vec2 :: struct { x, y: i32; }
-    
-    Hex_Directions := Vec2.[
-        .{  1, 0 }, .{  1, -1 }, .{ 0, -1 }, 
-        .{ -1, 0 }, .{ -1,  1 }, .{ 0,  1 }, 
-    ];
-
-[ ] :UnaryFieldAccessIsGross
+[X] `fallthrough` in a for loop does not emit deferred statments correctly.
 
 List of things to change:
 [X] Currently, there is no way to use the initialized members of a structure without using a struct literal.

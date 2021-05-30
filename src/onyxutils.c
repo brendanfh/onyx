@@ -1341,6 +1341,21 @@ static AstNode* lookup_default_value_by_idx(AstNode* provider, i32 idx) {
     }
 }
 
+static i32 maximum_argument_count(AstNode* provider) {
+    switch (provider->kind) {
+        case Ast_Kind_Struct_Literal: {
+            AstStructLiteral* sl = (AstStructLiteral *) provider;
+            assert(sl->type);
+
+            return type_structlike_mem_count(sl->type);
+        }
+    }
+
+    // NOTE: This returns int_max for anything other than struct literals because the
+    // bounds checking on the arguments will be done elsewhere.
+    return 0x7fffffff;
+}
+
 // NOTE: The values array can be partially filled out, and is the resulting array.
 // Returns if all the values were filled in.
 b32 fill_in_arguments(Arguments* args, AstNode* provider, char** err_msg) {
@@ -1376,6 +1391,12 @@ b32 fill_in_arguments(Arguments* args, AstNode* provider, char** err_msg) {
             *err_msg = bh_aprintf(global_scratch_allocator, "No value given for %d%s argument.", idx + 1, bh_num_suffix(idx + 1));
             success = 0;
         }
+    }
+
+    i32 maximum_arguments = maximum_argument_count(provider);
+    if (bh_arr_length(args->values) > maximum_arguments) {
+        *err_msg = bh_aprintf(global_scratch_allocator, "Too many values provided. Expected at most %d.", maximum_arguments);
+        success = 0;
     }
 
     return success;
@@ -1431,3 +1452,54 @@ i32 string_process_escape_seqs(char* dest, char* src, i32 len) {
 
     return total_len;
 }
+
+char* lookup_included_file(char* filename, char* relative_to, b32 add_onyx_suffix, b32 search_included_folders) {
+    assert(relative_to != NULL);
+
+    static char path[256];
+    fori (i, 0, 256) path[i] = 0;
+
+    static char fn[128];
+    fori (i, 0, 128) fn[i] = 0;
+
+    if (!bh_str_ends_with(filename, ".onyx") && add_onyx_suffix) {
+        bh_snprintf(fn, 128, "%s.onyx", filename);
+    } else {
+        bh_snprintf(fn, 128, "%s", filename);
+    }
+
+#if defined(_BH_LINUX)
+    #define DIR_SEPARATOR '/'
+#elif defined(_BH_WINDOWS)
+    #define DIR_SEPARATOR '\\'
+#endif
+
+    fori (i, 0, 128) if (fn[i] == '/') fn[i] = DIR_SEPARATOR;
+
+    if (bh_str_starts_with(filename, "./")) {
+        if (relative_to[strlen(relative_to) - 1] != DIR_SEPARATOR)
+            bh_snprintf(path, 256, "%s%c%s", relative_to, DIR_SEPARATOR, fn + 2);
+        else
+            bh_snprintf(path, 256, "%s%s", relative_to, fn + 2);
+
+        if (bh_file_exists(path)) return bh_path_get_full_name(path, global_scratch_allocator);
+
+        return fn;
+    }
+
+    if (search_included_folders) {
+        bh_arr_each(const char *, folder, context.options->included_folders) {
+            if ((*folder)[strlen(*folder) - 1] != DIR_SEPARATOR)
+                bh_snprintf(path, 256, "%s%c%s", *folder, DIR_SEPARATOR, fn);
+            else
+                bh_snprintf(path, 256, "%s%s", *folder, fn);
+
+            if (bh_file_exists(path)) return bh_path_get_full_name(path, global_scratch_allocator);
+        }
+    }
+
+    return fn;
+
+#undef DIR_SEPARATOR
+}
+
