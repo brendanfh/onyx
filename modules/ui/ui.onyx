@@ -1,0 +1,316 @@
+package ui
+
+use package core
+
+@Cleanup // Move these to the theme?
+// Or create a cache of fonts and put pointers/string in the themes?
+#private font : bmfont.BMFont;
+#private font_texture : gl.GLTexture;
+
+@Temporary
+DEFAULT_TEXT_SIZE :: 1.0f
+
+
+UI_Id :: #type u32
+
+#private hot_item    : UI_Id = 0
+#private active_item : UI_Id = 0
+#private hot_item_was_set := false
+
+Mouse_State :: struct {
+    left_button_down      := false;
+    left_button_just_down := false;
+    left_button_just_up   := false;
+
+    right_button_down      := false;
+    right_button_just_down := false;
+    right_button_just_up   := false;
+
+    x: f32 = 0;
+    y: f32 = 0;
+}
+
+mouse_state := Mouse_State.{};
+
+Keyboard_State :: struct {
+    Max_Keys_Per_Frame :: 4;
+
+    Key_State :: struct {
+        code: u32 = 0;
+        modifiers: Modifiers = ~~0;
+
+        Modifiers :: enum #flags {
+            CTRL; ALT; SHIFT; META;
+        }
+    }
+
+    keycodes_down_this_frame  : [Max_Keys_Per_Frame] Key_State;
+    keys_down_this_frame      : u32;
+
+    keycodes_up_this_frame    : [Max_Keys_Per_Frame] Key_State;
+    keys_up_this_frame        : u32;
+}
+
+@Note // This assumes that this gets zero intialized.
+keyboard_state: Keyboard_State;
+
+
+init_ui :: () {
+    init_font();
+
+    map.init(^animation_states, default=.{}, hash_count=4);
+}
+
+// This function should be called at the end of drawing a frame, after all of the UI elements
+// had a chance to interact with the hardware events.
+clear_buttons :: () {
+    mouse_state.left_button_just_up    = false;
+    mouse_state.left_button_just_down  = false;
+    mouse_state.right_button_just_up   = false;
+    mouse_state.right_button_just_down = false;
+
+    // I don't think these need to be cleared every frame, so long as you don't try
+    // to use them without checking keys_down_this_frame first.
+    // for ^key: keyboard_state.keycodes_down_this_frame do *key = .{};
+    // for ^key: keyboard_state.keycodes_up_this_frame do *key = .{};
+
+    keyboard_state.keys_down_this_frame = 0;
+    keyboard_state.keys_up_this_frame = 0;
+
+    if !hot_item_was_set do set_hot_item(0);
+    hot_item_was_set = false;
+}
+
+//
+// Telling the UI system about hardware updates
+//
+
+update_mouse_position :: (new_x: f32, new_y: f32) {
+    mouse_state.x = new_x;
+    mouse_state.y = new_y;
+}
+
+#private_file Mouse_Button_Kind :: enum { Left; Right; Middle; }
+
+button_pressed :: (kind: Mouse_Button_Kind) {
+    switch kind {
+        case .Left {
+            mouse_state.left_button_down      = true;
+            mouse_state.left_button_just_down = true;
+        }
+        case .Right {
+            mouse_state.right_button_down      = true;
+            mouse_state.right_button_just_down = true;
+        }
+    }
+}
+
+button_released :: (kind: Mouse_Button_Kind) {
+    switch kind {
+        case .Left {
+            mouse_state.left_button_down    = false;
+            mouse_state.left_button_just_up = true;
+        }
+
+        case .Right {
+            mouse_state.right_button_down    = false;
+            mouse_state.right_button_just_up = true;
+        }
+    }
+}
+
+key_down :: (keycode: u32, modifiers: Keyboard_State.Key_State.Modifiers) {
+    keyboard_state.keycodes_down_this_frame[keyboard_state.keys_down_this_frame] = .{
+        keycode,
+        modifiers
+    };
+
+    keyboard_state.keys_down_this_frame += 1;
+}
+
+key_up :: (keycode: u32, modifiers: Keyboard_State.Key_State.Modifiers) {
+    keyboard_state.keycodes_up_this_frame[keyboard_state.keys_up_this_frame] = .{
+        keycode,
+        modifiers
+    };
+
+    keyboard_state.keys_up_this_frame += 1;
+}
+
+set_active_item :: (id: UI_Id) -> bool {
+    active_item = id;
+    return true;
+}
+
+set_hot_item :: (id: UI_Id) -> bool {
+    if active_item != 0 do return false;
+
+    hot_item_was_set = true;
+
+    hot_item = id;
+    return true;
+}
+
+is_active_item :: (id: UI_Id) -> bool {
+    return active_item == id;
+}
+
+is_hot_item :: (id: UI_Id) -> bool {
+    return hot_item == id;
+}
+
+@FontSizing // Currently, `size` is just a multipler for the baked font size. This should be changed to be height in pixels, or 'em's.
+draw_text_raw :: (text: str, x: f32, y: f32, size := DEFAULT_TEXT_SIZE, color := gfx.Color4.{1,1,1}) {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, font_texture);
+    gfx.use_alpha_shader(0);
+
+    for glyph: bmfont.get_character_positions(^font, size, text, x, y) {
+        gfx.textured_rect(
+            .{ glyph.pos_x, glyph.pos_y }, .{ glyph.pos_w, glyph.pos_h },
+            .{ glyph.tex_x, glyph.tex_y }, .{ glyph.tex_w, glyph.tex_h },
+            color = color);
+    }
+    
+    gfx.flush();
+    gl.bindTexture(gl.TEXTURE_2D, -1);
+}
+
+draw_rect :: #match {
+    (use r: Rectangle, color := gfx.Color4.{1,1,1}) {
+        gfx.set_texture();
+
+        width, height := Rectangle.dimensions(r);
+        gfx.rect(.{ x0, y0 }, .{ width, height }, color);
+    },
+
+    (x: f32, y: f32, w: f32, h: f32, color := gfx.Color4.{1,1,1}) {
+        gfx.set_texture();
+        gfx.rect(.{ x, y }, .{ w, h }, color);
+    }
+}
+
+draw_text :: (use r: Rectangle, text: str, theme := ^default_text_theme, site := #callsite) -> bool {
+    draw_text_raw(text, x0, y0 + ~~font.common.baseline * theme.font_size, theme.font_size, theme.text_color);
+}
+
+Rectangle :: struct {
+    //
+    // x0,y0 ------------+
+    //   |               |
+    //   |               |
+    //   +------------ x1,y1
+    //
+
+    x0: f32 = 0;
+    y0: f32 = 0;
+    x1: f32 = 0;
+    y1: f32 = 0;
+
+    width  :: (use r: Rectangle) -> f32 do return math.abs(x1 - x0);
+    height :: (use r: Rectangle) -> f32 do return math.abs(y1 - y0);
+
+    dimensions :: (use r: Rectangle) -> (width: f32, height: f32) {
+        return width(r), height(r);
+    }
+
+    top_left     :: (use r: Rectangle) -> (x: f32, y: f32) do return math.min(x0, x1), math.min(y0, y1);
+    top_right    :: (use r: Rectangle) -> (x: f32, y: f32) do return math.max(x0, x1), math.min(y0, y1);
+    bottom_left  :: (use r: Rectangle) -> (x: f32, y: f32) do return math.min(x0, x1), math.max(y0, y1);
+    bottom_right :: (use r: Rectangle) -> (x: f32, y: f32) do return math.max(x0, x1), math.max(y0, y1);
+
+    contains :: (use r: Rectangle, x: f32, y: f32) -> bool {
+        return math.min(x0, x1) <= x && x <= math.max(x0, x1) &&
+               math.min(y0, y1) <= y && y <= math.max(y0, y1);
+    }
+}
+
+
+
+
+@Relocate
+Text_Theme :: struct {
+    text_color := gfx.Color4.{ 1, 1, 1 };
+    font_size  := 1.0f;
+}
+
+default_text_theme := Text_Theme.{};
+
+
+Animation_Theme :: struct {
+    hover_speed       := 0.1f;
+    click_decay_speed := 0.08f;
+}
+
+
+
+// Animation states are stored globally as there is not much to the state of a button.
+// Forcing the end user to store a structure for each button that is just the animation
+// state of the component feels very wrong.
+#private animation_states : map.Map(UI_Id, Animation_State);
+
+Animation_State :: struct {
+    hover_time := 0.0f;
+    click_time := 0.0f;
+}
+
+
+
+
+// Utilities
+get_site_hash :: (site: CallSite, increment := 0) -> UI_Id {
+    hash :: package core.hash
+
+    file_hash   := hash.to_u32(site.file);
+    line_hash   := hash.to_u32(site.line);
+    column_hash := hash.to_u32(site.column);
+
+    return file_hash * 0x472839 + line_hash * 0x6849210 + column_hash * 0x1248382 + increment;
+}
+
+get_text_width :: (text: str, size := DEFAULT_TEXT_SIZE) -> f32 {
+    return font->get_width(text, size);
+}
+
+
+@Cleanup
+// There should be a way to load multiple fonts and have a font cache.
+// The font cache pointers should be stable so you can take a pointer
+// to a font and it will remain valid. Probably want some kind of arena
+// with a map from i32 -> ^BMFont.
+#private init_font :: () {
+    fnt_file_data := #file_contents "./resources/fonts/Calibri.fnt";
+    texture_data := #file_contents "./resources/fonts/Calibri_0.data";
+
+    font = bmfont.load_bmfont(fnt_file_data);
+
+    tex_width, tex_height := font.common.scale_width, font.common.scale_height;
+
+    font_texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, font_texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.ALPHA, tex_width, tex_height, 0, gl.ALPHA, gl.UNSIGNED_BYTE, texture_data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, -1);
+}
+
+
+
+
+
+#private move_towards :: (value: ^$T, target: T, step: T) {
+    if *value < target do *value += step;
+    if *value > target do *value -= step;
+    if *value > target - step && *value < target + step do *value = target;
+}
+
+#private color_lerp :: (t: f32, c1: gfx.Color4, c2: gfx.Color4) -> gfx.Color4 {
+    return .{
+        r = c1.r * (1 - t) + c2.r * t,
+        g = c1.g * (1 - t) + c2.g * t,
+        b = c1.b * (1 - t) + c2.b * t,
+        a = c1.a * (1 - t) + c2.a * t,   @Cleanup // should this be interpolating alphas?
+    };
+}

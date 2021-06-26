@@ -16,6 +16,7 @@ typedef enum CheckStatus {
     Check_Complete, // The node is done processing
 
     Check_Errors_Start,
+    Check_Yield_Macro,
     Check_Error,    // There was an error when checking the node
 } CheckStatus;
 
@@ -37,7 +38,7 @@ CheckStatus check_compound(AstCompound* compound);
 CheckStatus check_expression(AstTyped** expr);
 CheckStatus check_address_of(AstAddressOf* aof);
 CheckStatus check_dereference(AstDereference* deref);
-CheckStatus check_array_access(AstArrayAccess* expr);
+CheckStatus check_subscript(AstSubscript** paa);
 CheckStatus check_field_access(AstFieldAccess** pfield);
 CheckStatus check_method_call(AstBinaryOp** mcall);
 CheckStatus check_size_of(AstSizeOf* so);
@@ -50,6 +51,10 @@ CheckStatus check_function_header(AstFunction* func);
 CheckStatus check_memres_type(AstMemRes* memres);
 CheckStatus check_memres(AstMemRes* memres);
 CheckStatus check_type(AstType* type);
+
+
+// HACK HACK HACK
+b32 expression_types_must_be_known = 0;
 
 static inline void fill_in_type(AstTyped* node);
 
@@ -113,7 +118,7 @@ CheckStatus check_return(AstReturn* retnode) {
     } else {
         if (expected_return_type->Basic.size > 0) {
             onyx_report_error(retnode->token->pos,
-                "Returning from non-void function without value. Expected a value of type '%s'.",
+                "Returning from non-void function without a value. Expected a value of type '%s'.",
                 type_get_name(expected_return_type));
             return Check_Error;
         }
@@ -125,15 +130,29 @@ CheckStatus check_return(AstReturn* retnode) {
 CheckStatus check_if(AstIfWhile* ifnode) {
     if (ifnode->assignment != NULL) CHECK(statement, (AstNode **) &ifnode->assignment);
 
-    CHECK(expression, &ifnode->cond);
+    if (ifnode->kind == Ast_Kind_Static_If) {
+        if ((ifnode->flags & Ast_Flag_Static_If_Resolved) == 0) {
+            return Check_Yield_Macro;
+        }
 
-    if (!type_is_bool(ifnode->cond->type)) {
-        onyx_report_error(ifnode->cond->token->pos, "expected boolean type for condition");
-        return Check_Error;
+        if (static_if_resolution(ifnode)) {
+            if (ifnode->true_stmt != NULL) CHECK(statement, (AstNode **) &ifnode->true_stmt);
+            
+        } else {
+            if (ifnode->false_stmt != NULL) CHECK(statement, (AstNode **) &ifnode->false_stmt);
+        }
+
+    } else {
+        CHECK(expression, &ifnode->cond);
+
+        if (!type_is_bool(ifnode->cond->type)) {
+            onyx_report_error(ifnode->cond->token->pos, "Expected expression of type 'bool' for condition, got '%s'", type_get_name(ifnode->cond->type));
+            return Check_Error;
+        }
+
+        if (ifnode->true_stmt)  CHECK(statement, (AstNode **) &ifnode->true_stmt);
+        if (ifnode->false_stmt) CHECK(statement, (AstNode **) &ifnode->false_stmt);
     }
-
-    if (ifnode->true_stmt)  CHECK(statement, (AstNode **) &ifnode->true_stmt);
-    if (ifnode->false_stmt) CHECK(statement, (AstNode **) &ifnode->false_stmt);
 
     return Check_Success;
 }
@@ -144,7 +163,7 @@ CheckStatus check_while(AstIfWhile* whilenode) {
     CHECK(expression, &whilenode->cond);
 
     if (!type_is_bool(whilenode->cond->type)) {
-        onyx_report_error(whilenode->cond->token->pos, "expected boolean type for condition");
+        onyx_report_error(whilenode->cond->token->pos, "Expected expression of type 'bool' for condition, got '%s'", type_get_name(whilenode->cond->type));
         return Check_Error;
     }
 
@@ -267,10 +286,12 @@ CheckStatus check_switch(AstSwitch* switchnode) {
         return Check_Error;
     }
 
+    // LEAK if this has to be yielded
     bh_imap_init(&switchnode->case_map, global_heap_allocator, bh_arr_length(switchnode->cases) * 2);
 
     switchnode->min_case = 0xffffffffffffffff;
 
+    // Umm, this doesn't check the type of the case expression to the type of the expression
     bh_arr_each(AstSwitchCase, sc, switchnode->cases) {
         CHECK(block, sc->block);
 
@@ -278,10 +299,7 @@ CheckStatus check_switch(AstSwitch* switchnode) {
             CHECK(expression, value);
 
             // :UnaryFieldAccessIsGross
-            if ((*value)->kind == Ast_Kind_Unary_Field_Access) {
-                type_check_or_auto_cast(value, resolved_expr_type);
-            }
-
+            // if ((*value)->kind == Ast_Kind_Unary_Field_Access) {
             if ((*value)->kind == Ast_Kind_Range_Literal) {
                 AstRangeLiteral* rl = (AstRangeLiteral *) (*value);
                 resolve_expression_type(rl->low);
@@ -303,6 +321,25 @@ CheckStatus check_switch(AstSwitch* switchnode) {
                     if (add_case_to_switch_statement(switchnode, case_value, sc->block, rl->token->pos))
                         return Check_Error;
                 }
+
+                continue;
+            }
+
+            if (!type_check_or_auto_cast(value, resolved_expr_type)) {
+                OnyxToken* tkn = sc->block->token;
+                if ((*value)->token) tkn = (*value)->token;
+
+                onyx_report_error(tkn->pos, "Mismatched types in switch-case. Expected '%s', got '%s'.",
+                    type_get_name(resolved_expr_type), type_get_name((*value)->type));
+                
+                return Check_Error;
+            }
+
+            if (node_is_type((AstNode*) (*value))) {
+                Type* type = type_build_from_ast(context.ast_alloc, (AstType*) (*value));
+
+                if (add_case_to_switch_statement(switchnode, type->id, sc->block, sc->block->token->pos))
+                    return Check_Error;
 
                 continue;
             }
@@ -381,36 +418,46 @@ CheckStatus check_call(AstCall* call) {
     //      8. If callee is an intrinsic, turn call into an Intrinsic_Call node
     //      9. Check types of formal and actual params against each other, handling varargs
 
+    if (call->flags & Ast_Flag_Has_Been_Checked) return Check_Success;
+
     CHECK(expression, &call->callee);
-    check_arguments(&call->args);
+    CHECK(arguments, &call->args);
 
     // SPEED CLEANUP: Keeping an original copy for basically no reason except that sometimes you
     // need to know the baked argument values in code generation.
+    // This should only be done once, but right now it is being done everytime this is checked,
+    // which can be multiple if we have to yield on a callee's type.
     arguments_clone(&call->original_args, &call->args);
 
     if (call->callee->kind == Ast_Kind_Overloaded_Function) {
-        call->callee = find_matching_overload_by_arguments(((AstOverloadedFunction *) call->callee)->overloads, &call->args);
-        if (call->callee == NULL) {
-            report_unable_to_match_overload(call);
-            return Check_Error;
+        AstTyped* new_callee = find_matching_overload_by_arguments(((AstOverloadedFunction *) call->callee)->overloads, &call->args);
+        if (new_callee == NULL) {
+            if (call->callee->entity->state > Entity_State_Check_Types) {
+                report_unable_to_match_overload(call);
+                return Check_Error;
+
+            } else {
+                return Check_Yield_Macro;
+            }
         }
+
+        call->callee = new_callee;
     }
 
     if (call->callee->kind == Ast_Kind_Polymorphic_Proc) {
-        call->callee = (AstTyped *) polymorphic_proc_lookup((AstPolyProc *) call->callee, PPLM_By_Arguments, &call->args, call->token);
-        if (call->callee == NULL) return Check_Error;
+        AstTyped* new_callee = (AstTyped *) polymorphic_proc_lookup((AstPolyProc *) call->callee, PPLM_By_Arguments, &call->args, call->token);
+        if (new_callee == (AstTyped *) &node_that_signals_a_yield) return Check_Yield_Macro;
+        if (new_callee == NULL) return Check_Error;
 
         arguments_remove_baked(&call->args);
+        call->callee = new_callee;
     }
 
     AstFunction* callee = (AstFunction *) call->callee;
 
     // NOTE: Build callee's type
     fill_in_type((AstTyped *) callee);
-    if (callee->type == NULL) {
-        onyx_report_error(call->token->pos, "There was an error with looking up the type of this function.");
-        return Check_Error;
-    }
+    if (callee->type == NULL) return Check_Yield_Macro;
 
     if (callee->type->kind != Type_Kind_Function) {
         onyx_report_error(call->token->pos,
@@ -442,6 +489,41 @@ CheckStatus check_call(AstCall* call) {
 
         onyx_report_error(call->token->pos, "Not all arguments were given a value.");
         return Check_Error;
+    }
+
+    // HACK HACK HACK
+    // :CallSiteIsGross
+    bh_arr_each(AstArgument *, arg, arg_arr) {
+        AstTyped** arg_value = &(*arg)->value;
+
+        if ((*arg_value)->kind == Ast_Kind_Call_Site) {
+            AstCallSite* callsite = (AstCallSite *) ast_clone(context.ast_alloc, *arg_value);
+            callsite->callsite_token = call->token;
+
+            // HACK CLEANUP
+            OnyxToken* str_token = bh_alloc(context.ast_alloc, sizeof(OnyxToken));
+            str_token->text  = bh_strdup(global_heap_allocator, (char *) call->token->pos.filename);
+            str_token->length = strlen(call->token->pos.filename);
+            str_token->pos = call->token->pos;
+            str_token->type = Token_Type_Literal_String;
+
+            AstStrLit* filename = bh_alloc_item(context.ast_alloc, AstStrLit);
+            memset(filename, 0, sizeof(AstStrLit));
+            filename->kind  = Ast_Kind_StrLit;
+            filename->token = str_token;
+            filename->addr  = 0;
+            
+            add_entities_for_node(NULL, (AstNode *) filename, NULL, NULL);
+            callsite->filename = filename;
+
+            callsite->line   = make_int_literal(context.ast_alloc, call->token->pos.line);
+            callsite->column = make_int_literal(context.ast_alloc, call->token->pos.column);
+
+            convert_numlit_to_type(callsite->line,   &basic_types[Basic_Kind_U32]);
+            convert_numlit_to_type(callsite->column, &basic_types[Basic_Kind_U32]);
+
+            *arg_value = (AstTyped *) callsite;
+        }
     }
 
     // NOTE: If we are calling an intrinsic function, translate the
@@ -488,7 +570,7 @@ CheckStatus check_call(AstCall* call) {
                 }
 
                 // CLEANUP POTENTIAL BUG if the builtin_vararg_type_type is ever rebuilt
-                if (formal_params[arg_pos] == builtin_vararg_type_type) {
+                if ((i16) arg_pos == callee->type->Function.vararg_arg_pos) {
                     arg_state = AS_Expecting_Untyped_VA;
                     continue;
                 }
@@ -549,6 +631,8 @@ CheckStatus check_call(AstCall* call) {
 
 type_checking_done:
 
+    call->flags |= Ast_Flag_Has_Been_Checked;
+
     if (arg_pos < callee->type->Function.needed_param_count) {
         onyx_report_error(call->token->pos, "Too few arguments to function call.");
         return Check_Error;
@@ -571,7 +655,7 @@ static void report_bad_binaryop(AstBinaryOp* binop) {
             node_get_type_name(binop->right));
 }
 
-CheckStatus check_binop_assignment(AstBinaryOp* binop, b32 assignment_is_ok) {
+CheckStatus check_binaryop_assignment(AstBinaryOp* binop, b32 assignment_is_ok) {
     if (!assignment_is_ok) {
         onyx_report_error(binop->token->pos, "Assignment not valid in expression.");
         return Check_Error;
@@ -601,8 +685,13 @@ CheckStatus check_binop_assignment(AstBinaryOp* binop, b32 assignment_is_ok) {
             resolve_expression_type(binop->right);
 
             if (binop->right->type == NULL) {
-                onyx_report_error(binop->token->pos, "Could not resolve type of right hand side to infer.");
-                return Check_Error;
+                if (binop->right->entity == NULL || binop->right->entity->state > Entity_State_Check_Types) {
+                    onyx_report_error(binop->token->pos, "Could not resolve type of right hand side to infer.");
+                    return Check_Error;
+
+                } else {
+                    return Check_Yield_Macro;
+                }
             }
 
             if (binop->right->type->kind == Type_Kind_Compound) {
@@ -657,6 +746,12 @@ CheckStatus check_binop_assignment(AstBinaryOp* binop, b32 assignment_is_ok) {
         binop->operation = Binary_Op_Assign;
     }
 
+    if (binop->right->type == NULL) {
+        if (binop->right->entity != NULL && binop->right->entity->state <= Entity_State_Check_Types) {
+            return Check_Yield_Macro;
+        }
+    }
+
     if (!type_check_or_auto_cast(&binop->right, binop->left->type)) {
         onyx_report_error(binop->token->pos,
                 "Cannot assign value of type '%s' to a '%s'.",
@@ -670,27 +765,63 @@ CheckStatus check_binop_assignment(AstBinaryOp* binop, b32 assignment_is_ok) {
     return Check_Success;
 }
 
+static b32 binary_op_is_allowed(BinaryOp operation, Type* type) {
+    static const u8 binop_allowed[Binary_Op_Count] = {
+        /* Add */             Basic_Flag_Numeric | Basic_Flag_Pointer,
+        /* Minus */           Basic_Flag_Numeric | Basic_Flag_Pointer,
+        /* Multiply */        Basic_Flag_Numeric,
+        /* Divide */          Basic_Flag_Numeric,
+        /* Modulus */         Basic_Flag_Integer,
+
+        /* Equal */           Basic_Flag_Equality,
+        /* Not_Equal */       Basic_Flag_Equality,
+        /* Less */            Basic_Flag_Ordered,
+        /* Less_Equal */      Basic_Flag_Ordered,
+        /* Greater */         Basic_Flag_Ordered,
+        /* Greater_Equal */   Basic_Flag_Ordered,
+
+        /* And */             Basic_Flag_Integer,
+        /* Or */              Basic_Flag_Integer,
+        /* Xor */             Basic_Flag_Integer,
+        /* Shl */             Basic_Flag_Integer,
+        /* Shr */             Basic_Flag_Integer,
+        /* Sar */             Basic_Flag_Integer,
+
+        /* Bool_And */        Basic_Flag_Boolean,
+        /* Bool_Or */         Basic_Flag_Boolean,
+
+        /* Assign_Start */    0,
+        /* Assign */          0,
+        /* Assign_Add */      0,
+        /* Assign_Minus */    0,
+        /* Assign_Multiply */ 0,
+        /* Assign_Divide */   0,
+        /* Assign_Modulus */  0,
+        /* Assign_And */      0,
+        /* Assign_Or */       0,
+        /* Assign_Xor */      0,
+        /* Assign_Shl */      0,
+        /* Assign_Shr */      0,
+        /* Assign_Sar */      0,
+        /* Assign_End */      0,
+
+        /* Pipe */            0,
+        /* Range */           0,
+    };
+
+    enum BasicFlag effective_flags = 0;
+    switch (type->kind) {
+        case Type_Kind_Basic:    effective_flags = type->Basic.flags;  break;
+        case Type_Kind_Pointer:  effective_flags = Basic_Flag_Pointer; break;
+        case Type_Kind_Enum:     effective_flags = Basic_Flag_Integer; break;
+        case Type_Kind_Function: effective_flags = Basic_Flag_Equality; break;
+    }
+
+    return (binop_allowed[operation] & effective_flags) != 0;
+}
+
 CheckStatus check_binaryop_compare(AstBinaryOp** pbinop) {
     AstBinaryOp* binop = *pbinop;
-
-    // :UnaryFieldAccessIsGross
-    if (binop->left->kind == Ast_Kind_Unary_Field_Access || binop->right->kind == Ast_Kind_Unary_Field_Access) {
-        if      (type_check_or_auto_cast(&binop->left, binop->right->type));
-        else if (type_check_or_auto_cast(&binop->right, binop->left->type));
-        else {
-            report_bad_binaryop(binop);
-            return Check_Error;
-        }
-
-        binop->type = &basic_types[Basic_Kind_Bool];
-        return Check_Success;
-    }
-
-    if (   type_is_structlike_strict(binop->left->type)
-        || type_is_structlike_strict(binop->right->type)) {
-        report_bad_binaryop(binop);
-        return Check_Error;
-    }
 
     // HACK: Since ^... to rawptr is a one way conversion, strip any pointers
     // away so they can be compared as expected
@@ -717,6 +848,11 @@ CheckStatus check_binaryop_compare(AstBinaryOp** pbinop) {
                     type_get_name(rtype));
             return Check_Error;
         }
+    }
+
+    if (!binary_op_is_allowed(binop->operation, binop->left->type)) {
+        report_bad_binaryop(binop);
+        return Check_Error;
     }
 
     binop->type = &basic_types[Basic_Kind_Bool];
@@ -781,10 +917,28 @@ CheckStatus check_binaryop(AstBinaryOp** pbinop, b32 assignment_is_ok) {
         binop->flags |= Ast_Flag_Comptime;
     }
 
-    if (binop_is_assignment(binop->operation)) return check_binop_assignment(binop, assignment_is_ok);
+    if (binop_is_assignment(binop->operation)) return check_binaryop_assignment(binop, assignment_is_ok);
+
+    if (expression_types_must_be_known) {
+        if (binop->left->type == NULL || binop->right->type == NULL) {
+            onyx_report_error(binop->token->pos, "Internal compiler error: one of the operands types is unknown here.");
+            return Check_Error;
+        }
+    }
+
+    // :UnaryFieldAccessIsGross
+    if (binop->left->kind == Ast_Kind_Unary_Field_Access || binop->right->kind == Ast_Kind_Unary_Field_Access) {
+        if      (type_check_or_auto_cast(&binop->left, binop->right->type));
+        else if (type_check_or_auto_cast(&binop->right, binop->left->type));
+        else {
+            report_bad_binaryop(binop);
+            return Check_Error;
+        }
+    }
 
     // NOTE: Try operator overloading before checking everything else.
-    if (binop->left->type->kind != Type_Kind_Basic || binop->right->type->kind != Type_Kind_Basic) {
+    if ((binop->left->type != NULL && binop->right->type != NULL) &&
+        (binop->left->type->kind != Type_Kind_Basic || binop->right->type->kind != Type_Kind_Basic)) {
         AstCall *implicit_call = binaryop_try_operator_overload(binop);
 
         if (implicit_call != NULL) {
@@ -852,59 +1006,13 @@ CheckStatus check_binaryop(AstBinaryOp** pbinop, b32 assignment_is_ok) {
         }
     }
 
-    static const u8 binop_allowed[Binary_Op_Count] = {
-        /* Add */             Basic_Flag_Numeric | Basic_Flag_Pointer,
-        /* Minus */           Basic_Flag_Numeric | Basic_Flag_Pointer,
-        /* Multiply */        Basic_Flag_Numeric,
-        /* Divide */          Basic_Flag_Numeric,
-        /* Modulus */         Basic_Flag_Integer,
-
-        /* Equal */           Basic_Flag_Ordered,
-        /* Not_Equal */       Basic_Flag_Ordered,
-        /* Less */            Basic_Flag_Ordered,
-        /* Less_Equal */      Basic_Flag_Ordered,
-        /* Greater */         Basic_Flag_Ordered,
-        /* Greater_Equal */   Basic_Flag_Ordered,
-
-        /* And */             Basic_Flag_Integer,
-        /* Or */              Basic_Flag_Integer,
-        /* Xor */             Basic_Flag_Integer,
-        /* Shl */             Basic_Flag_Integer,
-        /* Shr */             Basic_Flag_Integer,
-        /* Sar */             Basic_Flag_Integer,
-
-        /* Bool_And */        Basic_Flag_Boolean,
-        /* Bool_Or */         Basic_Flag_Boolean,
-
-        /* Assign_Start */    0,
-        /* Assign */          0,
-        /* Assign_Add */      0,
-        /* Assign_Minus */    0,
-        /* Assign_Multiply */ 0,
-        /* Assign_Divide */   0,
-        /* Assign_Modulus */  0,
-        /* Assign_And */      0,
-        /* Assign_Or */       0,
-        /* Assign_Xor */      0,
-        /* Assign_Shl */      0,
-        /* Assign_Shr */      0,
-        /* Assign_Sar */      0,
-        /* Assign_End */      0,
-
-        /* Pipe */            0,
-        /* Range */           0,
-    };
-
     binop->type = binop->left->type;
+    if (!binary_op_is_allowed(binop->operation, binop->type)) goto bad_binaryop;
 
-    enum BasicFlag effective_flags = 0;
-    switch (binop->type->kind) {
-        case Type_Kind_Basic:   effective_flags = binop->type->Basic.flags; break;
-        case Type_Kind_Pointer: effective_flags = Basic_Flag_Pointer;       break;
-        case Type_Kind_Enum:    effective_flags = Basic_Flag_Integer;       break;
+    // NOTE: Enum flags with '&' result in a boolean value
+    if (binop->type->kind == Type_Kind_Enum && binop->type->Enum.is_flags && binop->operation == Binary_Op_And) {
+         binop->type = &basic_types[Basic_Kind_Bool];
     }
-
-    if ((binop_allowed[binop->operation] & effective_flags) == 0) goto bad_binaryop;
 
     if (binop->flags & Ast_Flag_Comptime) {
         // NOTE: Not a binary op
@@ -929,6 +1037,8 @@ CheckStatus check_unaryop(AstUnaryOp** punop) {
 
     if (unaryop->operation == Unary_Op_Cast) {
         char* err;
+        if (unaryop->type == NULL) return Check_Yield_Macro;
+
         if (!cast_is_legal(unaryop->expr->type, unaryop->type, &err)) {
             onyx_report_error(unaryop->token->pos, "Cast Error: %s", err);
             return Check_Error;
@@ -978,7 +1088,7 @@ CheckStatus check_struct_literal(AstStructLiteral* sl) {
         }
 
         fill_in_type((AstTyped *) sl);
-        if (sl->type == NULL) return Check_Error;
+        if (sl->type == NULL) return Check_Yield_Macro;
     }
 
     if (!type_is_structlike_strict(sl->type)) {
@@ -991,25 +1101,29 @@ CheckStatus check_struct_literal(AstStructLiteral* sl) {
     i32 mem_count = type_structlike_mem_count(sl->type);
     arguments_ensure_length(&sl->args, mem_count);
 
-    char* err_msg = NULL;
-    if (!fill_in_arguments(&sl->args, (AstNode *) sl, &err_msg)) {
-        onyx_report_error(sl->token->pos, err_msg);
-        
-        bh_arr_each(AstTyped *, value, sl->args.values) {
-            if (*value == NULL) {
-                i32 member_idx = value - sl->args.values; // Pointer subtraction hack
-                StructMember smem;
-                type_lookup_member_by_idx(sl->type, member_idx, &smem);
+    // :Idempotency
+    if ((sl->flags & Ast_Flag_Has_Been_Checked) == 0) {
+        char* err_msg = NULL;
+        if (!fill_in_arguments(&sl->args, (AstNode *) sl, &err_msg)) {
+            onyx_report_error(sl->token->pos, err_msg);
+            
+            bh_arr_each(AstTyped *, value, sl->args.values) {
+                if (*value == NULL) {
+                    i32 member_idx = value - sl->args.values; // Pointer subtraction hack
+                    StructMember smem;
+                    type_lookup_member_by_idx(sl->type, member_idx, &smem);
 
-                onyx_report_error(sl->token->pos,
-                    "Value not given for %d%s member, '%s', for type '%s'.",
-                    member_idx + 1, bh_num_suffix(member_idx + 1),
-                    smem.name, type_get_name(sl->type));
+                    onyx_report_error(sl->token->pos,
+                        "Value not given for %d%s member, '%s', for type '%s'.",
+                        member_idx + 1, bh_num_suffix(member_idx + 1),
+                        smem.name, type_get_name(sl->type));
+                }
             }
-        }
 
-        return Check_Error;
+            return Check_Error;
+        }
     }
+    sl->flags |= Ast_Flag_Has_Been_Checked;
 
     AstTyped** actual = sl->args.values;
     StructMember smem;
@@ -1021,6 +1135,13 @@ CheckStatus check_struct_literal(AstStructLiteral* sl) {
 
     fori (i, 0, mem_count) {
         CHECK(expression, actual);
+
+        // HACK HACK HACK
+        if ((*actual)->type == NULL &&
+            (*actual)->entity != NULL &&
+            (*actual)->entity->state <= Entity_State_Check_Types) {
+            return Check_Yield_Macro;
+        }
 
         // NOTE: Not checking the return on this function because
         // this for loop is bounded by the number of members in the
@@ -1046,6 +1167,7 @@ CheckStatus check_struct_literal(AstStructLiteral* sl) {
 }
 
 CheckStatus check_array_literal(AstArrayLiteral* al) {
+    // :Idempotency
     if ((al->flags & Ast_Flag_Array_Literal_Typed) == 0) {
         if (al->atnode == NULL) return Check_Success;
 
@@ -1055,7 +1177,7 @@ CheckStatus check_array_literal(AstArrayLiteral* al) {
         }
 
         fill_in_type((AstTyped *) al);
-        if (al->type == NULL) return Check_Error;
+        if (al->type == NULL) return Check_Yield_Macro;
 
         al->type = type_make_array(context.ast_alloc, al->type, bh_arr_length(al->values));
         if (al->type == NULL || al->type->kind != Type_Kind_Array) {
@@ -1077,6 +1199,13 @@ CheckStatus check_array_literal(AstArrayLiteral* al) {
     Type* elem_type = al->type->Array.elem;
     bh_arr_each(AstTyped *, expr, al->values) {
         CHECK(expression, expr);
+
+        // HACK HACK HACK
+        if ((*expr)->type == NULL &&
+            (*expr)->entity != NULL &&
+            (*expr)->entity->state <= Entity_State_Check_Types) {
+            return Check_Yield_Macro;
+        }
 
         al->flags &= ((*expr)->flags & Ast_Flag_Comptime) | (al->flags &~ Ast_Flag_Comptime);
 
@@ -1137,8 +1266,11 @@ CheckStatus check_compound(AstCompound* compound) {
 
 CheckStatus check_address_of(AstAddressOf* aof) {
     CHECK(expression, &aof->expr);
+    if (aof->expr->type == NULL) {
+        return Check_Yield_Macro;
+    }
 
-    if ((aof->expr->kind != Ast_Kind_Array_Access
+    if ((aof->expr->kind != Ast_Kind_Subscript
             && aof->expr->kind != Ast_Kind_Dereference
             && aof->expr->kind != Ast_Kind_Field_Access
             && aof->expr->kind != Ast_Kind_Memres
@@ -1163,7 +1295,7 @@ CheckStatus check_dereference(AstDereference* deref) {
         return Check_Error;
     }
 
-    if (deref->expr->type == basic_type_rawptr.type) {
+    if (deref->expr->type == basic_type_rawptr.basic_type) {
         onyx_report_error(deref->token->pos, "Cannot dereference 'rawptr'. Cast to another pointer type first.");
         return Check_Error;
     }
@@ -1173,71 +1305,88 @@ CheckStatus check_dereference(AstDereference* deref) {
     return Check_Success;
 }
 
-CheckStatus check_array_access(AstArrayAccess* aa) {
-    CHECK(expression, &aa->addr);
-    CHECK(expression, &aa->expr);
+CheckStatus check_subscript(AstSubscript** psub) {
+    AstSubscript* sub = *psub;
+    CHECK(expression, &sub->addr);
+    CHECK(expression, &sub->expr);
 
-    if (!type_is_array_accessible(aa->addr->type)) {
-        onyx_report_error(aa->token->pos,
+    // NOTE: Try operator overloading before checking everything else.
+    if ((sub->addr->type != NULL && sub->expr->type != NULL) &&
+        (sub->addr->type->kind != Type_Kind_Basic || sub->expr->type->kind != Type_Kind_Basic)) {
+        // AstSubscript is the same as AstBinaryOp for the first sizeof(AstBinaryOp) bytes
+        AstBinaryOp* binop = (AstBinaryOp *) sub;
+        AstCall *implicit_call = binaryop_try_operator_overload(binop);
+
+        if (implicit_call != NULL) {
+            CHECK(call, implicit_call);
+
+            // NOTE: Not an array access
+            *psub = (AstSubscript *) implicit_call;
+            return Check_Success;
+        }
+    }
+
+    if (!type_is_array_accessible(sub->addr->type)) {
+        onyx_report_error(sub->token->pos,
                 "Expected pointer or array type for left of array access, got '%s'.",
-                node_get_type_name(aa->addr));
+                node_get_type_name(sub->addr));
         return Check_Error;
     }
 
-    if (types_are_compatible(aa->expr->type, builtin_range_type_type)) {
+    if (types_are_compatible(sub->expr->type, builtin_range_type_type)) {
         Type *of = NULL;
-        if (aa->addr->type->kind == Type_Kind_Pointer)
-            of = aa->addr->type->Pointer.elem;
-        else if (aa->addr->type->kind == Type_Kind_Array)
-            of = aa->addr->type->Array.elem;
+        if (sub->addr->type->kind == Type_Kind_Pointer)
+            of = sub->addr->type->Pointer.elem;
+        else if (sub->addr->type->kind == Type_Kind_Array)
+            of = sub->addr->type->Array.elem;
         else {
             // FIXME: Slice creation should be allowed for slice types and dynamic array types, like it
             // is below, but this code doesn't look at that.
-            onyx_report_error(aa->token->pos, "Invalid type for left of slice creation.");
+            onyx_report_error(sub->token->pos, "Invalid type for left of slice creation.");
             return Check_Error;
         }
 
-        aa->kind = Ast_Kind_Slice;
-        aa->type = type_make_slice(context.ast_alloc, of);
-        aa->elem_size = type_size_of(of);
+        sub->kind = Ast_Kind_Slice;
+        sub->type = type_make_slice(context.ast_alloc, of);
+        sub->elem_size = type_size_of(of);
 
         return Check_Success;
     }
 
-    resolve_expression_type(aa->expr);
-    if (aa->expr->type->kind != Type_Kind_Basic
-            || (aa->expr->type->Basic.kind != Basic_Kind_I32 && aa->expr->type->Basic.kind != Basic_Kind_U32)) {
-        onyx_report_error(aa->token->pos,
+    resolve_expression_type(sub->expr);
+    if (sub->expr->type->kind != Type_Kind_Basic
+            || (sub->expr->type->Basic.kind != Basic_Kind_I32 && sub->expr->type->Basic.kind != Basic_Kind_U32)) {
+        onyx_report_error(sub->token->pos,
             "Expected type u32 or i32 for index, got '%s'.",
-            node_get_type_name(aa->expr));
+            node_get_type_name(sub->expr));
         return Check_Error;
     }
 
-    if (aa->addr->type->kind == Type_Kind_Pointer)
-        aa->type = aa->addr->type->Pointer.elem;
-    else if (aa->addr->type->kind == Type_Kind_Array)
-        aa->type = aa->addr->type->Array.elem;
-    else if (aa->addr->type->kind == Type_Kind_Slice
-            || aa->addr->type->kind == Type_Kind_DynArray
-            || aa->addr->type->kind == Type_Kind_VarArgs) {
+    if (sub->addr->type->kind == Type_Kind_Pointer)
+        sub->type = sub->addr->type->Pointer.elem;
+    else if (sub->addr->type->kind == Type_Kind_Array)
+        sub->type = sub->addr->type->Array.elem;
+    else if (sub->addr->type->kind == Type_Kind_Slice
+            || sub->addr->type->kind == Type_Kind_DynArray
+            || sub->addr->type->kind == Type_Kind_VarArgs) {
         // If we are accessing on a slice or a dynamic array, implicitly add a field access for the data member
         StructMember smem;
-        type_lookup_member(aa->addr->type, "data", &smem);
+        type_lookup_member(sub->addr->type, "data", &smem);
 
-        AstFieldAccess* fa = make_field_access(context.ast_alloc, aa->addr, "data");
+        AstFieldAccess* fa = make_field_access(context.ast_alloc, sub->addr, "data");
         fa->type   = smem.type;
         fa->offset = smem.offset;
         fa->idx    = smem.idx;
 
-        aa->addr = (AstTyped *) fa;
-        aa->type = aa->addr->type->Pointer.elem;
+        sub->addr = (AstTyped *) fa;
+        sub->type = sub->addr->type->Pointer.elem;
     }
     else {
-        onyx_report_error(aa->token->pos, "Invalid type for left of array access.");
+        onyx_report_error(sub->token->pos, "Invalid type for left of array access.");
         return Check_Error;
     }
 
-    aa->elem_size = type_size_of(aa->type);
+    sub->elem_size = type_size_of(sub->type);
 
     return Check_Success;
 }
@@ -1246,8 +1395,8 @@ CheckStatus check_field_access(AstFieldAccess** pfield) {
     AstFieldAccess* field = *pfield;
     CHECK(expression, &field->expr);
     if (field->expr->type == NULL) {
-        onyx_report_error(field->token->pos, "Unable to deduce type of expression for accessing field.");
-        return Check_Error;
+        // onyx_report_error(field->token->pos, "Unable to deduce type of expression for accessing field.");
+        return Check_Yield_Macro;
     }
 
     if (!type_is_structlike(field->expr->type)) {
@@ -1259,12 +1408,9 @@ CheckStatus check_field_access(AstFieldAccess** pfield) {
         return Check_Error;
     }
 
-    if (!is_lval((AstNode *) field->expr)) {
-        onyx_report_error(field->token->pos,
-            "Cannot access field '%b'. Expression is not an lval.",
-            field->token->text,
-            field->token->length);
-        return Check_Error;
+    // Optimization for (*foo).member.
+    if (field->expr->kind == Ast_Kind_Dereference) {
+        field->expr = ((AstDereference *) field->expr)->expr;
     }
 
     StructMember smem;
@@ -1301,23 +1447,30 @@ CheckStatus check_field_access(AstFieldAccess** pfield) {
 
 CheckStatus check_method_call(AstBinaryOp** mcall) {
     CHECK(expression, &(*mcall)->left);
+    if ((*mcall)->left->type == NULL) {
+        return Check_Yield_Macro;
+    }
 
     AstTyped* implicit_argument = (*mcall)->left;
-    
-    // Implicitly take the address of the value if it is not already a pointer type.
-    // This could be weird to think about semantically so some testing with real code
-    // would be good.                                      - brendanfh 2020/02/05
-    if (implicit_argument->type->kind != Type_Kind_Pointer)
-        implicit_argument = (AstTyped *) make_address_of(context.ast_alloc, implicit_argument);
-    
-    implicit_argument = (AstTyped *) make_argument(context.ast_alloc, implicit_argument);
 
     // Symbol resolution should have ensured that this is call node.
     AstCall* call_node = (AstCall *) (*mcall)->right;
     assert(call_node->kind == Ast_Kind_Call);
 
-    bh_arr_insertn(call_node->args.values, 0, 1);
-    call_node->args.values[0] = implicit_argument;
+    // :Idempotency
+    if (((*mcall)->flags & Ast_Flag_Has_Been_Checked) == 0) {
+        // Implicitly take the address of the value if it is not already a pointer type.
+        // This could be weird to think about semantically so some testing with real code
+        // would be good.                                      - brendanfh 2020/02/05
+        if (implicit_argument->type->kind != Type_Kind_Pointer)
+            implicit_argument = (AstTyped *) make_address_of(context.ast_alloc, implicit_argument);
+        
+        implicit_argument = (AstTyped *) make_argument(context.ast_alloc, implicit_argument);
+
+        bh_arr_insertn(call_node->args.values, 0, 1);
+        call_node->args.values[0] = implicit_argument;
+    }    
+    (*mcall)->flags |= Ast_Flag_Has_Been_Checked;
 
     CHECK(call, call_node);
     call_node->next = (*mcall)->next;
@@ -1330,10 +1483,8 @@ CheckStatus check_size_of(AstSizeOf* so) {
     fill_in_array_count(so->so_ast_type);
 
     so->so_type = type_build_from_ast(context.ast_alloc, so->so_ast_type);
-    if (so->so_type == NULL) {
-        onyx_report_error(so->token->pos, "Error with type used here.");
-        return Check_Error;
-    }
+    if (so->so_type == NULL) return Check_Yield_Macro;
+
     so->size = type_size_of(so->so_type);
 
     return Check_Success;
@@ -1343,10 +1494,8 @@ CheckStatus check_align_of(AstAlignOf* ao) {
     fill_in_array_count(ao->ao_ast_type);
 
     ao->ao_type = type_build_from_ast(context.ast_alloc, ao->ao_ast_type);
-    if (ao->ao_type == NULL) {
-        onyx_report_error(ao->token->pos, "Error with type used here.");
-        return Check_Error;
-    }
+    if (ao->ao_type == NULL) return Check_Yield_Macro;
+
     ao->alignment = type_alignment_of(ao->ao_type);
 
     return Check_Success;
@@ -1355,6 +1504,14 @@ CheckStatus check_align_of(AstAlignOf* ao) {
 CheckStatus check_expression(AstTyped** pexpr) {
     AstTyped* expr = *pexpr;
     if (expr->kind > Ast_Kind_Type_Start && expr->kind < Ast_Kind_Type_End) {
+        // This is to ensure that the type will exist when compiling. For example, a poly-call type
+        // would have to wait for the entity to pass through, which the code generation does not know
+        // about.
+        if (type_build_from_ast(context.ast_alloc, (AstType*) expr) == NULL) {
+            return Check_Yield_Macro;
+        }
+
+        expr->type = &basic_types[Basic_Kind_Type_Index];
         return Check_Success;
     }
 
@@ -1394,7 +1551,7 @@ CheckStatus check_expression(AstTyped** pexpr) {
         case Ast_Kind_Address_Of:    retval = check_address_of((AstAddressOf *) expr); break;
         case Ast_Kind_Dereference:   retval = check_dereference((AstDereference *) expr); break;
         case Ast_Kind_Slice:
-        case Ast_Kind_Array_Access:  retval = check_array_access((AstArrayAccess *) expr); break;
+        case Ast_Kind_Subscript:     retval = check_subscript((AstSubscript **) pexpr); break;
         case Ast_Kind_Field_Access:  retval = check_field_access((AstFieldAccess **) pexpr); break;
         case Ast_Kind_Method_Call:   retval = check_method_call((AstBinaryOp **) pexpr); break;
         case Ast_Kind_Size_Of:       retval = check_size_of((AstSizeOf *) expr); break;
@@ -1444,6 +1601,12 @@ CheckStatus check_expression(AstTyped** pexpr) {
             CHECK(compound, (AstCompound *) expr);
             break;
 
+        case Ast_Kind_Call_Site:
+            // NOTE: This has to be set here because if it were to be set in the parser,
+            // builtin_callsite_type wouldn't be known when parsing the builtin.onyx file.
+            expr->type_node = builtin_callsite_type;
+            break;
+
         case Ast_Kind_StrLit: break;
         case Ast_Kind_File_Contents: break;
         case Ast_Kind_Overloaded_Function: break;
@@ -1488,6 +1651,7 @@ CheckStatus check_statement(AstNode** pstmt) {
 
         case Ast_Kind_Return:     return check_return((AstReturn *) stmt);
         case Ast_Kind_If:         return check_if((AstIfWhile *) stmt);
+        case Ast_Kind_Static_If:  return check_if((AstIfWhile *) stmt);
         case Ast_Kind_While:      return check_while((AstIfWhile *) stmt);
         case Ast_Kind_For:        return check_for((AstFor *) stmt);
         case Ast_Kind_Switch:     return check_switch((AstSwitch *) stmt);
@@ -1504,9 +1668,19 @@ CheckStatus check_statement(AstNode** pstmt) {
         // in a block in order to efficiently allocate enough space and registers
         // for them all. Now with LocalAllocator, this is no longer necessary.
         // Therefore, locals stay in the tree and need to be passed along.
-        case Ast_Kind_Local:
-            fill_in_type((AstTyped *) stmt);
+        case Ast_Kind_Local: {
+            AstTyped* typed_stmt = (AstTyped *) stmt;
+            fill_in_type(typed_stmt);
+            if (typed_stmt->type_node != NULL && typed_stmt->type == NULL) {
+                if (!node_is_type((AstNode *) typed_stmt->type_node)) {
+                    onyx_report_error(stmt->token->pos, "Local's type is not a type.");
+                    return Check_Error;
+                }
+                
+                return Check_Yield_Macro;
+            }
             return Check_Success;
+        }
 
         default:
             CHECK(expression, (AstTyped **) pstmt);
@@ -1554,11 +1728,12 @@ CheckStatus check_block(AstBlock* block) {
 
 CheckStatus check_function(AstFunction* func) {
     if (func->flags & Ast_Flag_Already_Checked) return Check_Success;
+    if (func->entity_header && func->entity_header->state < Entity_State_Code_Gen) return Check_Yield_Macro;
     
     expected_return_type = func->type->Function.return_type;
     if (func->body) {
         CheckStatus status = check_block(func->body);
-        if (status != Check_Success && func->generated_from)
+        if (status == Check_Error && func->generated_from)
             onyx_report_error(func->generated_from->pos, "Error in polymorphic procedure generated from this location.");
 
         return status;
@@ -1570,26 +1745,52 @@ CheckStatus check_function(AstFunction* func) {
 }
 
 CheckStatus check_overloaded_function(AstOverloadedFunction* func) {
-    bh_arr_each(AstTyped *, node, func->overloads) {
-        if (   (*node)->kind != Ast_Kind_Function
-            && (*node)->kind != Ast_Kind_Polymorphic_Proc
-            && (*node)->kind != Ast_Kind_Overloaded_Function) {
-            onyx_report_error((*node)->token->pos, "Overload option not procedure. Got '%s'",
-                onyx_ast_node_kind_string((*node)->kind));
+    b32 done = 1;
 
+    bh_imap all_overloads;
+    bh_imap_init(&all_overloads, global_heap_allocator, 4);
+    build_all_overload_options(func->overloads, &all_overloads);
+
+    bh_arr_each(bh__imap_entry, entry, all_overloads.entries) {
+        AstTyped* node = (AstTyped *) entry->key;
+        if (node->kind == Ast_Kind_Overloaded_Function) continue;
+
+        if (   node->kind != Ast_Kind_Function
+            && node->kind != Ast_Kind_Polymorphic_Proc) {
+            onyx_report_error(node->token->pos, "Overload option not procedure. Got '%s'",
+                onyx_ast_node_kind_string(node->kind));
+
+            bh_imap_free(&all_overloads);
             return Check_Error;
+        }
+
+        if (node->kind == Ast_Kind_Function) {
+            AstFunction* func = (AstFunction *) node;
+            
+            if (func->entity_header && func->entity_header->state <= Entity_State_Check_Types) {
+                done = 0;
+            }
         }
     }
 
-    return Check_Success;
+    bh_imap_free(&all_overloads);
+
+    if (done) return Check_Success;
+    else      return Check_Yield_Macro;
 }
 
 CheckStatus check_struct(AstStructType* s_node) {
+    if (s_node->entity_defaults && s_node->entity_defaults->state < Entity_State_Check_Types) return Check_Yield_Macro;
+
     bh_arr_each(AstStructMember *, smem, s_node->members) {
         if ((*smem)->type_node == NULL && (*smem)->initial_value != NULL) {
             CHECK(expression, &(*smem)->initial_value);
+
             fill_in_type((*smem)->initial_value);
-            (*smem)->type = resolve_expression_type((*smem)->initial_value);
+            if ((*smem)->initial_value->type == NULL) return Check_Yield_Macro;
+
+            resolve_expression_type((*smem)->initial_value);
+            if ((*smem)->type == NULL) (*smem)->type = (*smem)->initial_value->type;
 
             if ((*smem)->type == NULL) {
                 onyx_report_error((*smem)->initial_value->token->pos, "Unable to deduce type of initial value. This is probably a compiler bug.");
@@ -1600,7 +1801,7 @@ CheckStatus check_struct(AstStructType* s_node) {
 
     // NOTE: fills in the stcache
     type_build_from_ast(context.ast_alloc, (AstType *) s_node);
-    if (s_node->stcache == NULL) return Check_Error;
+    if (s_node->stcache == NULL || !s_node->stcache_is_valid) return Check_Yield_Macro;
 
     bh_arr_each(StructMember *, smem, s_node->stcache->Struct.memarr) {
         if ((*smem)->type->kind == Type_Kind_Compound) {
@@ -1613,6 +1814,8 @@ CheckStatus check_struct(AstStructType* s_node) {
 }
 
 CheckStatus check_struct_defaults(AstStructType* s_node) {
+    if (s_node->entity_type && s_node->entity_type->state < Entity_State_Code_Gen) return Check_Yield_Macro;
+
     bh_arr_each(StructMember *, smem, s_node->stcache->Struct.memarr) {
         if ((*smem)->initial_value && *(*smem)->initial_value) {
             CHECK(expression, (*smem)->initial_value);
@@ -1633,6 +1836,8 @@ CheckStatus check_struct_defaults(AstStructType* s_node) {
 }
 
 CheckStatus check_function_header(AstFunction* func) {
+    if (func->entity_body && func->entity_body->state < Entity_State_Check_Types) return Check_Yield_Macro;
+
     b32 expect_default_param = 0;
     b32 has_had_varargs = 0;
 
@@ -1681,15 +1886,20 @@ CheckStatus check_function_header(AstFunction* func) {
         }
 
         if (local->type_node != NULL) CHECK(type, local->type_node);
+        if (local->type_node != NULL) {
+            if (!node_is_type((AstNode *) local->type_node)) {
+                onyx_report_error(local->token->pos, "Parameter type is not a type.");
+                return Check_Error;
+            }
+        }
 
         fill_in_type((AstTyped *) local);
-
         if (local->type == NULL) {
-            onyx_report_error(param->local->token->pos,
-                    "Unable to resolve type for parameter, '%b'.\n",
-                    local->token->text,
-                    local->token->length);
-            return Check_Error;
+            // onyx_report_error(param->local->token->pos,
+            //         "Unable to resolve type for parameter, '%b'",
+            //         local->token->text,
+            //         local->token->length);
+            return Check_Yield_Macro;
         }
 
         if (local->type->kind == Type_Kind_Compound) {
@@ -1723,32 +1933,14 @@ CheckStatus check_function_header(AstFunction* func) {
     if (func->return_type != NULL) CHECK(type, func->return_type);
 
     func->type = type_build_function_type(context.ast_alloc, func);
-
-    /*
-    CLEANUP: These checks need to be ported to a process directive check.
-    if ((func->flags & Ast_Flag_Exported) != 0) {
-        if ((func->flags & Ast_Flag_Foreign) != 0) {
-            onyx_report_error(func->token->pos, "exporting a foreign function");
-            return Check_Error;
-        }
-
-        if ((func->flags & Ast_Flag_Intrinsic) != 0) {
-            onyx_report_error(func->token->pos, "exporting a intrinsic function");
-            return Check_Error;
-        }
-
-        if (func->exported_name == NULL) {
-            onyx_report_error(func->token->pos, "exporting function without a name");
-            return Check_Error;
-        }
-    }
-    */
+    if (func->type == NULL) return Check_Yield_Macro;
 
     return Check_Success;
 }
 
 CheckStatus check_memres_type(AstMemRes* memres) {
     fill_in_type((AstTyped *) memres);
+    if (memres->type_node && !memres->type) return Check_Yield_Macro;
     return Check_Success;
 }
 
@@ -1773,6 +1965,9 @@ CheckStatus check_memres(AstMemRes* memres) {
             }
 
         } else {
+            if (memres->initial_value->type == NULL && memres->initial_value->entity != NULL && memres->initial_value->entity->state <= Entity_State_Check_Types) {
+                return Check_Yield_Macro;
+            }
             memres->type = memres->initial_value->type;
         }
     }
@@ -1798,8 +1993,11 @@ CheckStatus check_type(AstType* type) {
     return Check_Success;
 }
 
-CheckStatus check_static_if(AstStaticIf* static_if) {
+CheckStatus check_static_if(AstIf* static_if) {
+    expression_types_must_be_known = 1;
     CheckStatus result = check_expression(&static_if->cond);
+    if (result == Check_Yield_Macro) return Check_Yield_Macro;
+    expression_types_must_be_known = 0;
 
     if (result > Check_Errors_Start || !(static_if->cond->flags & Ast_Flag_Comptime)) {
         onyx_report_error(static_if->token->pos, "Expected this condition to be compile time known.");
@@ -1811,17 +2009,18 @@ CheckStatus check_static_if(AstStaticIf* static_if) {
         return Check_Error;
     }
 
-    AstNumLit* condition_value = (AstNumLit *) static_if->cond;
-    assert(condition_value->kind == Ast_Kind_NumLit); // This should be right, right?
+    static_if->flags |= Ast_Flag_Static_If_Resolved;
+
+    b32 resolution = static_if_resolution(static_if);
 
     if (context.options->print_static_if_results)
         bh_printf("Static if statement at %s:%d:%d resulted in %s\n",
             static_if->token->pos.filename,
             static_if->token->pos.line,
             static_if->token->pos.column,
-            condition_value->value.i ? "true" : "false");
+            resolution ? "true" : "false");
 
-    if (condition_value->value.i) {
+    if (resolution) {
         bh_arr_each(Entity *, ent, static_if->true_entities) {
             entity_heap_insert_existing(&context.entities, *ent);
         }
@@ -1835,6 +2034,15 @@ CheckStatus check_static_if(AstStaticIf* static_if) {
     return Check_Complete;
 }
 
+CheckStatus check_process_directive(AstNode* directive) {
+    if (directive->kind == Ast_Kind_Directive_Export) {
+        AstTyped* export = ((AstDirectiveExport *) directive)->export;
+        if (export->entity && export->entity->state <= Entity_State_Check_Types) return Check_Yield_Macro;
+    }
+
+    return Check_Success;
+}
+
 CheckStatus check_node(AstNode* node) {
     switch (node->kind) {
         case Ast_Kind_Function:             return check_function((AstFunction *) node);
@@ -1842,6 +2050,7 @@ CheckStatus check_node(AstNode* node) {
         case Ast_Kind_Block:                return check_block((AstBlock *) node);
         case Ast_Kind_Return:               return check_return((AstReturn *) node);
         case Ast_Kind_If:                   return check_if((AstIfWhile *) node);
+        case Ast_Kind_Static_If:            return check_if((AstIfWhile *) node);
         case Ast_Kind_While:                return check_while((AstIfWhile *) node);
         case Ast_Kind_Call:                 return check_call((AstCall *) node);
         case Ast_Kind_Binary_Op:            return check_binaryop((AstBinaryOp **) &node, 1);
@@ -1854,21 +2063,14 @@ void check_entity(Entity* ent) {
 
     switch (ent->type) {
         case Entity_Type_Foreign_Function_Header:
-        case Entity_Type_Function_Header:
-            cs = check_function_header(ent->function);
-            break;
-
-        case Entity_Type_Function:
-            cs = check_function(ent->function);
-            break;
-
-        case Entity_Type_Overloaded_Function:
-            cs = check_overloaded_function(ent->overloaded_function);
-            break;
-
-        case Entity_Type_Global:
-            cs = check_global(ent->global);
-            break;
+        case Entity_Type_Function_Header:          cs = check_function_header(ent->function); break;
+        case Entity_Type_Function:                 cs = check_function(ent->function); break;
+        case Entity_Type_Overloaded_Function:      cs = check_overloaded_function(ent->overloaded_function); break;
+        case Entity_Type_Global:                   cs = check_global(ent->global); break;
+        case Entity_Type_Struct_Member_Default:    cs = check_struct_defaults((AstStructType *) ent->type_alias); break;
+        case Entity_Type_Memory_Reservation_Type:  cs = check_memres_type(ent->mem_res); break;
+        case Entity_Type_Memory_Reservation:       cs = check_memres(ent->mem_res); break;
+        case Entity_Type_Static_If:                cs = check_static_if(ent->static_if); break;
 
         case Entity_Type_Expression:
             cs = check_expression(&ent->expr);
@@ -1882,28 +2084,16 @@ void check_entity(Entity* ent) {
                 cs = check_type(ent->type_alias);
             break;
 
-        case Entity_Type_Struct_Member_Default:
-            cs = check_struct_defaults((AstStructType *) ent->type_alias);
-            break;
-
-        case Entity_Type_Memory_Reservation_Type:
-            cs = check_memres_type(ent->mem_res);
-            break;
-
-        case Entity_Type_Memory_Reservation:
-            cs = check_memres(ent->mem_res);
-            break;
-
-        case Entity_Type_Static_If:
-            cs = check_static_if(ent->static_if);
-            break;
+        case Entity_Type_Process_Directive:        cs = check_process_directive((AstNode *) ent->expr); break;
 
         default: break;
     }
 
-    if (cs == Check_Success)  ent->state = Entity_State_Code_Gen;
-    if (cs == Check_Complete) ent->state = Entity_State_Finalized;
-    // else if (cs == Check_Yield) {
-    //     ent->attempts++;
-    // }
+    if (cs == Check_Success)     ent->state = Entity_State_Code_Gen;
+    if (cs == Check_Complete)    ent->state = Entity_State_Finalized;
+    if (cs == Check_Yield_Macro) ent->macro_attempts++;
+    else {
+        ent->macro_attempts = 0;
+        ent->micro_attempts = 0;
+    }
 }

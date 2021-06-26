@@ -57,7 +57,8 @@ void package_reinsert_use_packages(Package* package) {
     if (!package->use_package_entities) return;
 
     bh_arr_each(Entity *, use_package, package->use_package_entities) {
-        (*use_package)->state = Entity_State_Comptime_Resolve_Symbols;
+        (*use_package)->state = Entity_State_Resolve_Symbols;
+        (*use_package)->macro_attempts = 0;
         entity_heap_insert_existing(&context.entities, *use_package);
     } 
 
@@ -181,6 +182,10 @@ AstNode* try_symbol_raw_resolve_from_node(AstNode* node, char* symbol) {
                 package->package = package_lookup(package->package_name);
             }
 
+            if (package->package == NULL) {
+                return NULL;
+            }
+
             return symbol_raw_resolve(package->package->scope, symbol);
         } 
 
@@ -219,6 +224,9 @@ void scope_clear(Scope* scope) {
 //
 // Polymorphic Procedures
 //
+
+AstNode node_that_signals_a_yield = { 0 };
+
 static void ensure_polyproc_cache_is_created(AstPolyProc* pp) {
     if (pp->concrete_funcs == NULL) {
         bh_table_init(global_heap_allocator, pp->concrete_funcs, 16);
@@ -323,8 +331,11 @@ static b32 add_solidified_function_entities(AstSolidifiedFunction solidified_fun
         .scope = solidified_func.poly_scope,
     };
 
-    entity_heap_insert(&context.entities, func_header_entity);
-    entity_heap_insert(&context.entities, func_entity);
+    Entity* entity_header = entity_heap_insert(&context.entities, func_header_entity);
+    Entity* entity_body   = entity_heap_insert(&context.entities, func_entity);
+
+    solidified_func.func->entity_header = entity_header;
+    solidified_func.func->entity_body   = entity_body;
 
     return 1;
 }
@@ -648,6 +659,9 @@ static void solve_for_polymorphic_param_type(PolySolveResult* resolved, AstPolyP
     *resolved = solve_poly_type(param->poly_sym, param->type_expr, actual_type);
 }
 
+// HACK HACK HACK nocheckin
+static b32 flag_to_yield = 0;
+
 // NOTE: The job of this function is to look through the arguments provided and find a matching
 // value that is to be baked into the polymorphic procedures poly-scope. It expected that param
 // will be of kind PPK_Baked_Value.
@@ -667,20 +681,25 @@ static void solve_for_polymorphic_param_value(PolySolveResult* resolved, AstPoly
     // HACK: Storing the original value because if this was an AstArgument, we need to flag
     // it as baked if it is determined that the argument is of the correct kind and type.
     AstTyped* orig_value = value;
-    if (value->kind == Ast_Kind_Argument) value = ((AstArgument *) value)->value;
+    if (value->kind == Ast_Kind_Argument) {
+        ((AstArgument *) orig_value)->is_baked = 0;
+        value = ((AstArgument *) value)->value;
+    }
 
-    if (param->type_expr == (AstType *) &type_expr_symbol) {
+    if (param->type_expr == (AstType *) &basic_type_type_expr) {
         if (!node_is_type((AstNode *) value)) {
-            *err_msg = "Expected type expression.";
+            if (err_msg) *err_msg = "Expected type expression.";
             return;
         }
 
         Type* resolved_type = type_build_from_ast(context.ast_alloc, (AstType *) value);
+        if (resolved_type == NULL) flag_to_yield = 1;
+
         *resolved = ((PolySolveResult) { PSK_Type, .actual = resolved_type });
 
     } else {
         if ((value->flags & Ast_Flag_Comptime) == 0) {
-            *err_msg = "Expected compile-time known argument.";
+            if (err_msg) *err_msg = "Expected compile-time known argument.";
             return;
         }
 
@@ -688,7 +707,7 @@ static void solve_for_polymorphic_param_value(PolySolveResult* resolved, AstPoly
             param->type = type_build_from_ast(context.ast_alloc, param->type_expr);
 
         if (!type_check_or_auto_cast(&value, param->type)) {
-            *err_msg = bh_aprintf(global_scratch_allocator,
+            if (err_msg) *err_msg = bh_aprintf(global_scratch_allocator,
                     "The procedure '%s' expects a value of type '%s' for %d%s parameter, got '%s'.",
                     get_function_name(pp->base_func),
                     type_get_name(param->type),
@@ -739,6 +758,11 @@ static bh_arr(AstPolySolution) find_polymorphic_slns(AstPolyProc* pp, PolyProcLo
 
             default: if (err_msg) *err_msg = "Invalid polymorphic parameter kind. This is a compiler bug.";
         }
+
+        if (flag_to_yield) {
+            bh_arr_free(slns);
+            return NULL;
+        }
         
         switch (resolved.kind) {
             case PSK_Undefined:
@@ -786,6 +810,11 @@ AstFunction* polymorphic_proc_lookup(AstPolyProc* pp, PolyProcLookupMethod pp_lo
     char *err_msg = NULL;
     bh_arr(AstPolySolution) slns = find_polymorphic_slns(pp, pp_lookup, actual, &err_msg);
     if (slns == NULL) {
+        if (flag_to_yield) {
+            flag_to_yield = 0;
+            return (AstFunction *) &node_that_signals_a_yield;
+        }
+
         if (err_msg != NULL) onyx_report_error(tkn->pos, err_msg);
         else                 onyx_report_error(tkn->pos, "Some kind of error occured when generating a polymorphic procedure. You hopefully will not see this");
 
@@ -949,6 +978,32 @@ AstFunction* polymorphic_proc_build_only_header(AstPolyProc* pp, PolyProcLookupM
 //  * Resolving an overload from a TypeFunction (so an overloaded procedure can be passed as a parameter)
 //
 
+void add_overload_option(bh_arr(OverloadOption)* poverloads, u64 precedence, AstTyped* overload) {
+    bh_arr(OverloadOption) overloads = *poverloads;
+
+    i32 index = -1;
+    fori (i, 0, bh_arr_length(overloads)) {
+        if (overloads[i].precedence > precedence) {
+            index = i;
+            break;
+        }
+    }
+
+    if (index < 0) {
+        bh_arr_push(overloads, ((OverloadOption) {
+            .precedence = precedence,
+            .option     = overload,
+        }));
+
+    } else {
+        bh_arr_insertn(overloads, index, 1);
+        overloads[index].precedence = precedence;
+        overloads[index].option     = overload;
+    }
+
+    *poverloads = overloads;
+}
+
 // NOTE: The job of this function is to take a set of overloads, and traverse it to add all possible
 // overloads that are reachable. This is slightly more difficult than it may seem. In this language,
 // overloaded procedures have a strict ordering to their overloads, which determines how the correct
@@ -967,20 +1022,20 @@ AstFunction* polymorphic_proc_build_only_header(AstPolyProc* pp, PolyProcLookupM
 // an "entries" array that, so long as nothing is ever removed from it, will maintain the order in
 // which entries were put into the map. This is useful because a simple recursive algorithm can
 // collect all the overloads into the map, and also use the map to provide a base case.
-static void build_all_overload_options(bh_arr(AstTyped *) overloads, bh_imap* all_overloads) {
-    bh_arr_each(AstTyped *, node, overloads) {
-        if (bh_imap_has(all_overloads, (u64) *node)) continue;
+void build_all_overload_options(bh_arr(OverloadOption) overloads, bh_imap* all_overloads) {
+    bh_arr_each(OverloadOption, overload, overloads) {
+        if (bh_imap_has(all_overloads, (u64) overload->option)) continue;
 
-        bh_imap_put(all_overloads, (u64) *node, 1);
+        bh_imap_put(all_overloads, (u64) overload->option, 1);
 
-        if ((*node)->kind == Ast_Kind_Overloaded_Function) {
-            AstOverloadedFunction* sub_overload = (AstOverloadedFunction *) *node;
+        if (overload->option->kind == Ast_Kind_Overloaded_Function) {
+            AstOverloadedFunction* sub_overload = (AstOverloadedFunction *) overload->option;
             build_all_overload_options(sub_overload->overloads, all_overloads);
         }
     }
 }
 
-AstTyped* find_matching_overload_by_arguments(bh_arr(AstTyped *) overloads, Arguments* param_args) {
+AstTyped* find_matching_overload_by_arguments(bh_arr(OverloadOption) overloads, Arguments* param_args) {
     Arguments args;
     arguments_clone(&args, param_args);
     arguments_ensure_length(&args, bh_arr_length(args.values) + bh_arr_length(args.named_values));
@@ -1006,6 +1061,7 @@ AstTyped* find_matching_overload_by_arguments(bh_arr(AstTyped *) overloads, Argu
         // NOTE: Overload is not something that is known to be overloadable.
         if (overload == NULL) continue;
         if (overload->kind != Ast_Kind_Function) continue;
+        if (overload->type == NULL) continue;
 
         // NOTE: If the arguments cannot be placed successfully in the parameters list
         if (!fill_in_arguments(&args, (AstNode *) overload, NULL)) continue;
@@ -1024,7 +1080,11 @@ AstTyped* find_matching_overload_by_arguments(bh_arr(AstTyped *) overloads, Argu
             AstTyped** value    = &args.values[i];
 
             if (type_to_match->kind == Type_Kind_VarArgs) type_to_match = type_to_match->VarArgs.ptr_to_data->Pointer.elem;
-            if ((*value)->kind == Ast_Kind_Argument)      value = &((AstArgument *) *value)->value;
+            if ((*value)->kind == Ast_Kind_Argument) {
+                // :ArgumentResolvingIsComplicated
+                if (((AstArgument *) (*value))->is_baked) continue;
+                value = &((AstArgument *) *value)->value;
+            }
 
             if (!type_check_or_auto_cast(value, type_to_match)) {
                 all_arguments_work = 0;
@@ -1043,7 +1103,7 @@ AstTyped* find_matching_overload_by_arguments(bh_arr(AstTyped *) overloads, Argu
     return matched_overload;
 }
 
-AstTyped* find_matching_overload_by_type(bh_arr(AstTyped *) overloads, Type* type) {
+AstTyped* find_matching_overload_by_type(bh_arr(OverloadOption) overloads, Type* type) {
     if (type->kind != Type_Kind_Function) return NULL;
 
     bh_imap all_overloads;
@@ -1173,7 +1233,7 @@ AstStructType* polymorphic_struct_lookup(AstPolyStructType* ps_type, bh_arr(AstP
         sln->poly_sym = (AstNode *) &ps_type->poly_params[i];
         
         PolySolutionKind expected_kind = PSK_Undefined;
-        if ((AstNode *) ps_type->poly_params[i].type_node == &type_expr_symbol) {
+        if ((AstNode *) ps_type->poly_params[i].type_node == (AstNode *) &basic_type_type_expr) {
             expected_kind = PSK_Type;
         } else {
             expected_kind = PSK_Value;
@@ -1213,53 +1273,34 @@ AstStructType* polymorphic_struct_lookup(AstPolyStructType* ps_type, bh_arr(AstP
 
     char* unique_key = build_poly_slns_unique_key(slns);
     if (bh_table_has(AstStructType *, ps_type->concrete_structs, unique_key)) {
-        return bh_table_get(AstStructType *, ps_type->concrete_structs, unique_key);
+        AstStructType* concrete_struct = bh_table_get(AstStructType *, ps_type->concrete_structs, unique_key);
+
+        if (concrete_struct->entity_type->state < Entity_State_Check_Types) {
+            return NULL;
+        }
+
+        Type* cs_type = type_build_from_ast(context.ast_alloc, (AstType *) concrete_struct);
+        if (!cs_type) return NULL;
+
+        if (cs_type->Struct.poly_sln == NULL) cs_type->Struct.poly_sln = bh_arr_copy(global_heap_allocator, slns);
+        if (cs_type->Struct.name == NULL)     cs_type->Struct.name = build_poly_struct_name(ps_type, cs_type);
+
+        return concrete_struct;
     }
 
-    scope_clear(ps_type->scope);
-    insert_poly_slns_into_scope(ps_type->scope, slns);
+    Scope* sln_scope = scope_create(context.ast_alloc, ps_type->scope, ps_type->token->pos);
+    insert_poly_slns_into_scope(sln_scope, slns);
 
     AstStructType* concrete_struct = (AstStructType *) ast_clone(context.ast_alloc, ps_type->base_struct);
     bh_table_put(AstStructType *, ps_type->concrete_structs, unique_key, concrete_struct);
 
-    Entity struct_entity = {
-        .state = Entity_State_Resolve_Symbols,
-        .type = Entity_Type_Type_Alias,
-        .type_alias = (AstType *) concrete_struct,
-        .package = NULL,
-        .scope = ps_type->scope,
-    };
-    Entity struct_default_entity = {
-        .state = Entity_State_Resolve_Symbols,
-        .type = Entity_Type_Struct_Member_Default,
-        .type_alias = (AstType *) concrete_struct,
-        .package = NULL,
-        .scope = ps_type->scope,
-    };
-
-    entity_bring_to_state(&struct_entity, Entity_State_Check_Types);
-    entity_bring_to_state(&struct_default_entity, Entity_State_Check_Types);
-    entity_bring_to_state(&struct_entity, Entity_State_Code_Gen);
-    entity_bring_to_state(&struct_default_entity, Entity_State_Code_Gen);
- 
-    if (onyx_has_errors()) {
-        onyx_report_error(pos, "Error in creating polymorphic struct instantiation here.");
-        bh_table_put(AstStructType *, ps_type->concrete_structs, unique_key, NULL);
-        return NULL;
-    }
-
-    Type* cs_type = type_build_from_ast(context.ast_alloc, (AstType *) concrete_struct);
-
-    // CLEANUP: This should not be necessary since the only place this function can be
-    // called from is type_build_from_ast in the Ast_Kind_Poly_Call_Type case, which
-    // allocates the 'slns' array on the heap. So, duplicating it should not be necessary.
-    cs_type->Struct.poly_sln = bh_arr_copy(global_heap_allocator, slns);
-
-    cs_type->Struct.name = build_poly_struct_name(ps_type, cs_type);
-    return concrete_struct;
+    add_entities_for_node(NULL, (AstNode *) concrete_struct, sln_scope, NULL);
+    return NULL;
 }
 
 void entity_bring_to_state(Entity* ent, EntityState state) {
+    EntityState last_state = ent->state;
+
     while (ent->state != state) {
         switch (ent->state) {
             case Entity_State_Resolve_Symbols: symres_entity(ent); break;
@@ -1268,6 +1309,9 @@ void entity_bring_to_state(Entity* ent, EntityState state) {
 
             default: return;
         }
+
+        if (ent->state == last_state) break;
+        last_state = ent->state;
 
         if (onyx_has_errors()) return;
     }
@@ -1359,9 +1403,35 @@ static i32 maximum_argument_count(AstNode* provider) {
 // NOTE: The values array can be partially filled out, and is the resulting array.
 // Returns if all the values were filled in.
 b32 fill_in_arguments(Arguments* args, AstNode* provider, char** err_msg) {
+
+    { // Delete baked arguments
+        // :ArgumentResolvingIsComplicated
+        i32 max = bh_arr_length(args->values);
+        fori (i, 0, max) {
+            AstTyped* value = args->values[i];
+            if (value == NULL) continue;
+
+            if (value->kind == Ast_Kind_Argument) {
+                if (((AstArgument *) value)->is_baked) {
+                    i--;
+                    max--;
+                    bh_arr_deleten(args->values, i, 1);
+                }
+            }
+        }
+    }
+
     if (args->named_values != NULL) {
         bh_arr_each(AstNamedValue *, p_named_value, args->named_values) {
             AstNamedValue* named_value = *p_named_value;
+
+            if (named_value->value->kind == Ast_Kind_Argument) {
+                if (((AstArgument *) named_value->value)->is_baked) {
+                    // :ArgumentResolvingIsComplicated
+                    bh_arr_set_length(args->values, bh_arr_length(args->values) - 1);
+                    continue;
+                }
+            }
 
             token_toggle_end(named_value->token);
             i32 idx = lookup_idx_by_name(provider, named_value->token->text);

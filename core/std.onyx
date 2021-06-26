@@ -18,6 +18,7 @@ package core
 #load "./string"
 #load "./string/builder"
 #load "./string/reader"
+#load "./string/buffer"
 
 #load "./intrinsics/onyx"
 #load "./intrinsics/wasm"
@@ -39,6 +40,8 @@ package core
     #load "./wasi/env"
     #load "./wasi/clock"
     #load "./io/file"
+
+    #load "./type_info/helper"
 }
 
 #if runtime.Runtime == runtime.Runtime_Js {

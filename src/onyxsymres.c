@@ -6,8 +6,6 @@
 
 // Variables used during the symbol resolution phase.
 static Scope*       curr_scope    = NULL;
-static Package*     curr_package  = NULL;
-static AstFunction* curr_function = NULL;
 bh_arr(AstBlock *)  block_stack   = NULL;
 static b32 report_unresolved_symbols = 1;
 
@@ -57,7 +55,7 @@ static SymresStatus symres_enum(AstEnumType* enum_node);
 static SymresStatus symres_memres_type(AstMemRes** memres);
 static SymresStatus symres_memres(AstMemRes** memres);
 static SymresStatus symres_struct_defaults(AstType* st);
-static SymresStatus symres_static_if(AstStaticIf* static_if);
+static SymresStatus symres_static_if(AstIf* static_if);
 
 static void scope_enter(Scope* new_scope) {
     curr_scope = new_scope;
@@ -94,29 +92,6 @@ static SymresStatus symres_struct_type(AstStructType* s_node) {
     if (s_node->flags & Ast_Flag_Type_Is_Resolved) return Symres_Success;
 
     s_node->flags |= Ast_Flag_Type_Is_Resolved;
-    
-    {
-        bh_table(i32) mem_set;
-        bh_table_init(global_heap_allocator, mem_set, bh_arr_length(s_node->members));
-
-        bh_arr_each(AstStructMember *, member, s_node->members) {
-            token_toggle_end((*member)->token);
-
-            if (bh_table_has(i32, mem_set, (*member)->token->text)) {
-                onyx_report_error((*member)->token->pos,
-                        "Duplicate struct member '%s'.",
-                        (*member)->token->text);
-
-                token_toggle_end((*member)->token);
-                return Symres_Error;
-            }
-
-            bh_table_put(i32, mem_set, (*member)->token->text, 1);
-            token_toggle_end((*member)->token);
-        }
-
-        bh_table_free(mem_set);
-    }
 
     if (s_node->scope) {
         // FIX: This is probably wrong for the long term.
@@ -129,7 +104,12 @@ static SymresStatus symres_struct_type(AstStructType* s_node) {
         AstStructMember *member = s_node->members[i];
 
         if (member->type_node) {
-            SYMRES(type, &member->type_node);
+            SymresStatus ss = symres_type(&member->type_node);
+            if (ss != Symres_Success) {
+                s_node->flags &= ~Ast_Flag_Type_Is_Resolved;
+                if (s_node->scope) scope_leave();
+                return ss;
+            }
 
             if (!node_is_type((AstNode *) member->type_node)) {
                 onyx_report_error(member->token->pos, "Member type is not a type.");
@@ -212,7 +192,7 @@ static SymresStatus symres_type(AstType** type) {
 
         case Ast_Kind_Poly_Struct_Type: {
             AstPolyStructType* pst_node = (AstPolyStructType *) *type;
-            pst_node->scope = scope_create(context.ast_alloc, curr_scope, pst_node->token->pos);
+            pst_node->scope = scope_create(context.ast_alloc, pst_node->entity->scope, pst_node->token->pos);
 
             bh_arr_each(AstPolyStructParam, param, pst_node->poly_params) {
                 SYMRES(type, &param->type_node);
@@ -452,9 +432,9 @@ static SymresStatus symres_expression(AstTyped** expr) {
             break;
 
         case Ast_Kind_Slice:
-        case Ast_Kind_Array_Access:
-            SYMRES(expression, &((AstArrayAccess *)(*expr))->addr);
-            SYMRES(expression, &((AstArrayAccess *)(*expr))->expr);
+        case Ast_Kind_Subscript:
+            SYMRES(expression, &((AstSubscript *)(*expr))->addr);
+            SYMRES(expression, &((AstSubscript *)(*expr))->expr);
             break;
 
         case Ast_Kind_Struct_Literal:
@@ -491,21 +471,35 @@ static SymresStatus symres_return(AstReturn* ret) {
 }
 
 static SymresStatus symres_if(AstIfWhile* ifnode) {
-    if (ifnode->assignment != NULL) {
-        ifnode->scope = scope_create(context.ast_alloc, curr_scope, ifnode->token->pos);
-        scope_enter(ifnode->scope);
+    if (ifnode->kind == Ast_Kind_Static_If) {
+        if ((ifnode->flags & Ast_Flag_Static_If_Resolved) == 0) {
+            return Symres_Yield_Macro;
+        }
 
-        SYMRES(local, &ifnode->local);
+        if (static_if_resolution(ifnode)) {
+            if (ifnode->true_stmt != NULL)  SYMRES(statement, (AstNode **) &ifnode->true_stmt, NULL);
+            
+        } else {
+            if (ifnode->false_stmt != NULL) SYMRES(statement, (AstNode **) &ifnode->false_stmt, NULL);
+        }
 
-        SYMRES(statement, (AstNode **) &ifnode->assignment, NULL);
+    } else {
+        if (ifnode->assignment != NULL) {
+            ifnode->scope = scope_create(context.ast_alloc, curr_scope, ifnode->token->pos);
+            scope_enter(ifnode->scope);
+
+            SYMRES(local, &ifnode->local);
+
+            SYMRES(statement, (AstNode **) &ifnode->assignment, NULL);
+        }
+
+        SYMRES(expression, &ifnode->cond);
+
+        if (ifnode->true_stmt != NULL)  SYMRES(statement, (AstNode **) &ifnode->true_stmt, NULL);
+        if (ifnode->false_stmt != NULL) SYMRES(statement, (AstNode **) &ifnode->false_stmt, NULL);
+
+        if (ifnode->assignment != NULL) scope_leave();
     }
-
-    SYMRES(expression, &ifnode->cond);
-
-    if (ifnode->true_stmt != NULL)  SYMRES(statement, (AstNode **) &ifnode->true_stmt, NULL);
-    if (ifnode->false_stmt != NULL) SYMRES(statement, (AstNode **) &ifnode->false_stmt, NULL);
-
-    if (ifnode->assignment != NULL) scope_leave();
 
     return Symres_Success;
 }
@@ -604,6 +598,8 @@ static SymresStatus symres_use(AstUse* use) {
                 symbol_introduce(curr_scope, (*alias)->alias, thing);
             }
         }
+
+        package_track_use_package(package->package, use->entity);
 
         return Symres_Success;
     }
@@ -719,6 +715,7 @@ static SymresStatus symres_statement(AstNode** stmt, b32 *remove) {
     switch ((*stmt)->kind) {
         case Ast_Kind_Return:      SYMRES(return, (AstReturn *) *stmt);                  break;
         case Ast_Kind_If:          SYMRES(if, (AstIfWhile *) *stmt);                     break;
+        case Ast_Kind_Static_If:   SYMRES(if, (AstIfWhile *) *stmt);                     break;
         case Ast_Kind_While:       SYMRES(while, (AstIfWhile *) *stmt);                  break;
         case Ast_Kind_For:         SYMRES(for, (AstFor *) *stmt);                        break;
         case Ast_Kind_Switch:      SYMRES(switch, (AstSwitch *) *stmt);                  break;
@@ -787,13 +784,6 @@ SymresStatus symres_function_header(AstFunction* func) {
         if (param->default_value != NULL) {
             SYMRES(expression, &param->default_value);
             if (onyx_has_errors()) return Symres_Error;
-
-            // HACK: It shouldn't be necessary to do this twice, but right now
-            // if `null` is the default parameter and it hasn't been used anywhere in
-            // code yet, it doesn't resolve properly. So for now I am just checking symbols twice.
-            //                                                      -brendanfh 2020/12/24
-            SYMRES(expression, &param->default_value);
-            if (onyx_has_errors()) return Symres_Error;
         }
     }
 
@@ -813,60 +803,70 @@ SymresStatus symres_function_header(AstFunction* func) {
 SymresStatus symres_function(AstFunction* func) {
     if (func->scope == NULL)
         func->scope = scope_create(context.ast_alloc, curr_scope, func->token->pos);
+    if (func->entity_header && func->entity_header->state < Entity_State_Check_Types) return Symres_Yield_Macro;
 
     scope_enter(func->scope);
 
-    bh_arr_each(AstParam, param, func->params) {
-        symbol_introduce(curr_scope, param->local->token, (AstNode *) param->local);
+    if ((func->flags & Ast_Flag_Has_Been_Symres) == 0) {
+        bh_arr_each(AstParam, param, func->params) {
+            symbol_introduce(curr_scope, param->local->token, (AstNode *) param->local);
 
-        // CLEANUP: Currently, in order to 'use' parameters, the type must be completely
-        // resolved and built. This is excessive because all that should need to be known
-        // is the names of the members, since all that happens is implicit field accesses
-        // are placed in the scope. So instead, there should be a way to just query all the
-        // member names in the structure, without needing to know their type. This would be
-        // easy if it were not for 'use' statements in structs. It is made even more complicated
-        // by this situtation:
-        //
-        //     Foo :: struct (T: type_expr) {
-        //         use t : T;
-        // 
-        //         something_else := 5 + 6 * 8;
-        //     }
-        //
-        // The 'use t : T' member requires completely knowing the type of T, to know which
-        // members should be brought in. At the moment, that requires completely building the
-        // type of Foo($T).
-        if (param->local->flags & Ast_Flag_Param_Use) {
-            if (param->local->type_node != NULL && param->local->type == NULL) {
-                param->local->type = type_build_from_ast(context.ast_alloc, param->local->type_node);
-            }
+            // CLEANUP: Currently, in order to 'use' parameters, the type must be completely
+            // resolved and built. This is excessive because all that should need to be known
+            // is the names of the members, since all that happens is implicit field accesses
+            // are placed in the scope. So instead, there should be a way to just query all the
+            // member names in the structure, without needing to know their type. This would be
+            // easy if it were not for 'use' statements in structs. It is made even more complicated
+            // by this situtation:
+            //
+            //     Foo :: struct (T: type_expr) {
+            //         use t : T;
+            // 
+            //         something_else := 5 + 6 * 8;
+            //     }
+            //
+            // The 'use t : T' member requires completely knowing the type of T, to know which
+            // members should be brought in. At the moment, that requires completely building the
+            // type of Foo($T).
+            if (param->local->flags & Ast_Flag_Param_Use) {
+                if (param->local->type_node != NULL && param->local->type == NULL) {
+                    param->local->type = type_build_from_ast(context.ast_alloc, param->local->type_node);
 
-            if (type_is_struct(param->local->type)) {
-                Type* st;
-                if (param->local->type->kind == Type_Kind_Struct) {
-                    st = param->local->type;
-                } else {
-                    st = param->local->type->Pointer.elem;
+                    if (param->local->type == NULL) {
+                        // HACK HACK HACK
+                        scope_leave();
+                        return Symres_Yield_Macro;
+                    }
                 }
 
-                bh_table_each_start(StructMember, st->Struct.members);
-                    AstFieldAccess* fa = make_field_access(context.ast_alloc, (AstTyped *) param->local, value.name);
-                    symbol_raw_introduce(curr_scope, value.name, param->local->token->pos, (AstNode *) fa);
-                bh_table_each_end;
+                if (type_is_struct(param->local->type)) {
+                    Type* st;
+                    if (param->local->type->kind == Type_Kind_Struct) {
+                        st = param->local->type;
+                    } else {
+                        st = param->local->type->Pointer.elem;
+                    }
 
-            } else if (param->local->type != NULL) {
-                onyx_report_error(param->local->token->pos, "Can only 'use' structures or pointers to structures.");
+                    bh_table_each_start(StructMember, st->Struct.members);
+                        AstFieldAccess* fa = make_field_access(context.ast_alloc, (AstTyped *) param->local, value.name);
+                        symbol_raw_introduce(curr_scope, value.name, param->local->token->pos, (AstNode *) fa);
+                    bh_table_each_end;
 
-            } else {
-                // :ExplicitTyping
-                onyx_report_error(param->local->token->pos, "Cannot deduce type of parameter '%b'; Try adding it explicitly.",
-                    param->local->token->text,
-                    param->local->token->length);
+                } else if (param->local->type != NULL) {
+                    onyx_report_error(param->local->token->pos, "Can only 'use' structures or pointers to structures.");
+
+                } else {
+                    // :ExplicitTyping
+                    onyx_report_error(param->local->token->pos, "Cannot deduce type of parameter '%b'; Try adding it explicitly.",
+                        param->local->token->text,
+                        param->local->token->length);
+                }
             }
         }
+
+        func->flags |= Ast_Flag_Has_Been_Symres;
     }
 
-    curr_function = func;
     SYMRES(block, func->body);
 
     scope_leave();
@@ -879,8 +879,8 @@ static SymresStatus symres_global(AstGlobal* global) {
 }
 
 static SymresStatus symres_overloaded_function(AstOverloadedFunction* ofunc) {
-    bh_arr_each(AstTyped *, node, ofunc->overloads) {
-        SYMRES(expression, node);
+    bh_arr_each(OverloadOption, overload, ofunc->overloads) {
+        SYMRES(expression, &overload->option);
     }
     return Symres_Success;
 }
@@ -974,6 +974,9 @@ static SymresStatus symres_struct_defaults(AstType* t) {
         if ((*smem)->initial_value != NULL) {
             SYMRES(expression, &(*smem)->initial_value);
             
+            // CLEANUP: I hate that this is here. The type inference for a struct member should happen once the actual type is known.
+            // There seems to be a problem with setting it in the checker however, because whenever I disable this code, somehow
+            // the compiler gets to the code generation without all the types figured out???
             if ((*smem)->type_node == NULL && (*smem)->initial_value->type_node != NULL) {
                 (*smem)->type_node = (*smem)->initial_value->type_node;
             }
@@ -1003,7 +1006,7 @@ static SymresStatus symres_polyproc(AstPolyProc* pp) {
     return Symres_Success;
 }
 
-static SymresStatus symres_static_if(AstStaticIf* static_if) {
+static SymresStatus symres_static_if(AstIf* static_if) {
     SYMRES(expression, &static_if->cond);
     return Symres_Success;
 }
@@ -1021,7 +1024,8 @@ static SymresStatus symres_process_directive(AstNode* directive) {
 
             } else {
                 AstOverloadedFunction* ofunc = (AstOverloadedFunction *) add_overload->overloaded_function;
-                bh_arr_push(ofunc->overloads, (AstTyped *) add_overload->overload);
+                SYMRES(expression, (AstTyped **) &add_overload->overload);
+                add_overload_option(&ofunc->overloads, add_overload->precedence, add_overload->overload);
             }
 
             break;
@@ -1048,7 +1052,7 @@ static SymresStatus symres_process_directive(AstNode* directive) {
                 return Symres_Error;
             }
 
-            bh_arr_push(operator_overloads[operator->operator], operator->overload);
+            add_overload_option(&operator_overloads[operator->operator], 0, operator->overload);
             break;
         }
 
@@ -1061,6 +1065,24 @@ static SymresStatus symres_process_directive(AstNode* directive) {
             if (export->export->kind == Ast_Kind_Function) {
                 AstFunction *func = (AstFunction *) export->export;
                 func->exported_name = export->export_name;
+
+                if ((func->flags & Ast_Flag_Exported) != 0) {
+                    if ((func->flags & Ast_Flag_Foreign) != 0) {
+                        onyx_report_error(export->token->pos, "exporting a foreign function");
+                        return Symres_Error;
+                    }
+
+                    if ((func->flags & Ast_Flag_Intrinsic) != 0) {
+                        onyx_report_error(export->token->pos, "exporting a intrinsic function");
+                        return Symres_Error;
+                    }
+
+                    // NOTE: This should never happen
+                    if (func->exported_name == NULL) {
+                        onyx_report_error(export->token->pos, "exporting function without a name");
+                        return Symres_Error;
+                    }
+                }
             }
 
             break;
@@ -1073,8 +1095,6 @@ static SymresStatus symres_process_directive(AstNode* directive) {
 void symres_entity(Entity* ent) {
     if (block_stack == NULL) bh_arr_new(global_heap_allocator, block_stack, 16);
 
-    if (ent->package) curr_package = ent->package;
-
     Scope* old_scope = NULL;
     if (ent->scope) {
         old_scope = curr_scope;
@@ -1082,8 +1102,8 @@ void symres_entity(Entity* ent) {
     }
 
     report_unresolved_symbols = (context.entities.type_count[Entity_Type_Static_If] == 0 &&
-                                 context.entities.type_count[Entity_Type_Use_Package] == 0)
-                                || context.cycle_detected;
+                                 context.entities.type_count[Entity_Type_Use_Package] == 0);
+                                // || context.cycle_detected;
 
     SymresStatus ss = Symres_Success;
     EntityState next_state = Entity_State_Check_Types;
@@ -1091,16 +1111,12 @@ void symres_entity(Entity* ent) {
     switch (ent->type) {
         case Entity_Type_Binding: {
             symbol_introduce(curr_scope, ent->binding->token, ent->binding->node);
-            package_reinsert_use_packages(curr_package);
+            package_reinsert_use_packages(ent->package);
             next_state = Entity_State_Finalized;
             break;
         }
 
-        case Entity_Type_Static_If: {
-            ss = symres_static_if(ent->static_if);
-            next_state = Entity_State_Comptime_Check_Types;
-            break;
-        }
+        case Entity_Type_Static_If:               ss = symres_static_if(ent->static_if); break;
         
         case Entity_Type_Foreign_Function_Header:
         case Entity_Type_Function_Header:         ss = symres_function_header(ent->function); break;
@@ -1109,12 +1125,7 @@ void symres_entity(Entity* ent) {
         case Entity_Type_Foreign_Global_Header:
         case Entity_Type_Global_Header:           ss = symres_global(ent->global); break;
 
-        case Entity_Type_Use_Package:             ss = symres_use(ent->use);
-                                                  if (ent->use->expr && ((AstPackage *) ent->use->expr)->package)
-                                                      package_track_use_package(((AstPackage *) ent->use->expr)->package, ent);
-                                                  next_state = Entity_State_Finalized;
-                                                  break;
-
+        case Entity_Type_Use_Package:
         case Entity_Type_Use:                     ss = symres_use(ent->use);
                                                   next_state = Entity_State_Finalized;
                                                   break;
@@ -1134,10 +1145,13 @@ void symres_entity(Entity* ent) {
         default: break;
     }
 
-    if (ss == Symres_Success)     ent->state = next_state;
     if (ss == Symres_Yield_Macro) ent->macro_attempts++;
     if (ss == Symres_Yield_Micro) ent->micro_attempts++;
+    if (ss == Symres_Success) {
+        ent->macro_attempts = 0;
+        ent->micro_attempts = 0;
+        ent->state = next_state;
+    }
 
     if (ent->scope) curr_scope = old_scope;
-    curr_package = NULL;
 }

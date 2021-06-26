@@ -64,6 +64,7 @@ static WasmType onyx_type_to_wasm_type(Type* type) {
             if (basic->size == 8) return WASM_TYPE_FLOAT64;
         }
         if (basic->flags & Basic_Flag_SIMD) return WASM_TYPE_VAR128;
+        if (basic->flags & Basic_Flag_Type_Index) return WASM_TYPE_INT32;
         if (basic->size == 0) return WASM_TYPE_VOID;
     }
 
@@ -240,7 +241,7 @@ EMIT_FUNC(binop,                         AstBinaryOp* binop);
 EMIT_FUNC(unaryop,                       AstUnaryOp* unop);
 EMIT_FUNC(call,                          AstCall* call);
 EMIT_FUNC(intrinsic_call,                AstCall* call);
-EMIT_FUNC(array_access_location,         AstArrayAccess* aa, u64* offset_return);
+EMIT_FUNC(subscript_location,            AstSubscript* sub, u64* offset_return);
 EMIT_FUNC(field_access_location,         AstFieldAccess* field, u64* offset_return);
 EMIT_FUNC(local_location,                AstLocal* local, u64* offset_return);
 EMIT_FUNC(memory_reservation_location,   AstMemRes* memres);
@@ -264,6 +265,7 @@ EMIT_FUNC(enter_structured_block,        StructuredBlockType sbt);
 EMIT_FUNC_NO_ARGS(leave_structured_block);
 
 #include "onyxwasm_intrinsics.c"
+#include "onyxwasm_type_table.c"
 
 EMIT_FUNC(function_body, AstFunction* fd) {
     if (fd->body == NULL) return;
@@ -387,6 +389,7 @@ EMIT_FUNC(statement, AstNode* stmt) {
     switch (stmt->kind) {
         case Ast_Kind_Return:     emit_return(mod, &code, (AstReturn *) stmt); break;
         case Ast_Kind_If:         emit_if(mod, &code, (AstIfWhile *) stmt); break;
+        case Ast_Kind_Static_If:  emit_if(mod, &code, (AstIfWhile *) stmt); break;
         case Ast_Kind_While:      emit_while(mod, &code, (AstIfWhile *) stmt); break;
         case Ast_Kind_For:        emit_for(mod, &code, (AstFor *) stmt); break;
         case Ast_Kind_Switch:     emit_switch(mod, &code, (AstSwitch *) stmt); break;
@@ -576,7 +579,9 @@ EMIT_FUNC(store_instruction, Type* type, u32 offset) {
 
     if (is_basic && (type->Basic.flags & Basic_Flag_Pointer)) {
         WID(WI_I32_STORE, ((WasmInstructionData) { 2, offset }));
-    } else if (is_basic && ((type->Basic.flags & Basic_Flag_Integer) || (type->Basic.flags & Basic_Flag_Boolean))) {
+    } else if (is_basic && ((type->Basic.flags & Basic_Flag_Integer)
+                         || (type->Basic.flags & Basic_Flag_Boolean)
+                         || (type->Basic.flags & Basic_Flag_Type_Index))) {
         if      (store_size == 1)   WID(WI_I32_STORE_8,  ((WasmInstructionData) { alignment, offset }));
         else if (store_size == 2)   WID(WI_I32_STORE_16, ((WasmInstructionData) { alignment, offset }));
         else if (store_size == 4)   WID(WI_I32_STORE,    ((WasmInstructionData) { alignment, offset }));
@@ -626,7 +631,9 @@ EMIT_FUNC(load_instruction, Type* type, u32 offset) {
         instr = WI_I32_LOAD;
         alignment = 2;
     }
-    else if (is_basic && ((type->Basic.flags & Basic_Flag_Integer) || (type->Basic.flags & Basic_Flag_Boolean))) {
+    else if (is_basic && ((type->Basic.flags & Basic_Flag_Integer)
+                       || (type->Basic.flags & Basic_Flag_Boolean)
+                       || (type->Basic.flags & Basic_Flag_Type_Index))) {
         if      (load_size == 1) instr = WI_I32_LOAD_8_S;
         else if (load_size == 2) instr = WI_I32_LOAD_16_S;
         else if (load_size == 4) instr = WI_I32_LOAD;
@@ -660,6 +667,17 @@ EMIT_FUNC(if, AstIfWhile* if_node) {
         bh_imap_put(&mod->local_map, (u64) if_node->local, local_allocate(mod->local_alloc, (AstTyped *) if_node->local));
 
         emit_assignment(mod, &code, if_node->assignment);
+    }
+
+    if (if_node->kind == Ast_Kind_Static_If) {
+        if (static_if_resolution(if_node)) {
+            if (if_node->true_stmt) emit_block(mod, &code, if_node->true_stmt, 1);
+        } else {
+            if (if_node->false_stmt) emit_block(mod, &code, if_node->false_stmt, 1);
+        }
+
+        *pcode = code;
+        return;
     }
 
     emit_expression(mod, &code, if_node->cond);
@@ -982,11 +1000,11 @@ EMIT_FUNC(for_iterator, AstFor* for_node, u64 iter_local) {
         u32 return_align = type_alignment_of(return_type);
         bh_align(return_size, return_align);
 
-        u64 stack_grow_amm = return_size;
-        bh_align(stack_grow_amm, 16);
+        u64 reserve_size = return_size;
+        bh_align(reserve_size, 16);
         
         WID(WI_GLOBAL_GET, stack_top_idx);
-        WID(WI_PTR_CONST, stack_grow_amm);
+        WID(WI_PTR_CONST, reserve_size);
         WI(WI_PTR_ADD);
         WID(WI_GLOBAL_SET, stack_top_idx);
 
@@ -994,12 +1012,12 @@ EMIT_FUNC(for_iterator, AstFor* for_node, u64 iter_local) {
         WID(WI_CALL_INDIRECT, ((WasmInstructionData) { type_idx, 0x00 }));
 
         WID(WI_GLOBAL_GET, stack_top_idx);
-        WID(WI_PTR_CONST, stack_grow_amm);
+        WID(WI_PTR_CONST, reserve_size);
         WI(WI_PTR_SUB);
         WID(WI_GLOBAL_SET, stack_top_idx);
 
         WID(WI_GLOBAL_GET, stack_top_idx);
-        emit_load_instruction(mod, &code, return_type, stack_grow_amm - return_size);
+        emit_load_instruction(mod, &code, return_type, reserve_size - return_size);
     }
 
     WIL(WI_LOCAL_SET, iterator_done_bool);
@@ -1323,120 +1341,139 @@ EMIT_FUNC(unaryop, AstUnaryOp* unop) {
     *pcode = code;
 }
 
+// Calling a procedure in Onyx.
+//
+// This documentation should be placed elsewhere, but for right now I'm going to write it in the relevant
+// piece of code. Calling a procedure is relatively simple, at least compared to other calling conventions
+// out there, mostly due the fact that this is WebAssembly, where registers are "infinite" and there's no
+// really need to use stack canaries for security.
+//
+// The biggest piece to understand is how the stack gets laid out for the called procedure. To be confusing,
+// there are two stacks at play: the WASM expression stack, and the linear memory stack. Here is the general
+// lay out for calling a procedure with the following signature.
+//
+//    foo :: (x: i32, y: str, z: [..] i32, va: ..i32) -> (i32, i32)
+//
+// WASM stack: top is last pushed
+//
+//    vararg count
+//    vararg pointer to variadic arguments in the linear memory
+//    pointer to struct-like arguments (z)
+//    simple structs/primitives (y, x)
+//
+// Linear memory stack:
+//  
+//     ... | struct-like arguments (z) | variadic arguments (va) | return space | ...
+//
+// The interesting part from above is the fact that 'y' gets passed on the WASM stack, not the linear memory
+// stack, even though a 'str' in Onyx is 2-component structure. This is because so-called "simple" structures,
+// i.e. structures that are completely flat, with no sub-structures, are passed as multiple primitives. I do
+// this because many times for interoperability, it is nicer to get two primitive values for the pointer and
+// count of a slice, instead of a pointer.
 EMIT_FUNC(call, AstCall* call) {
     bh_arr(WasmInstruction) code = *pcode;
 
-    u32 stack_grow_amm = 0;
     u64 stack_top_idx = bh_imap_get(&mod->index_map, (u64) &builtin_stack_top);
+    u64 stack_top_store_local = local_raw_allocate(mod->local_alloc, WASM_TYPE_PTR);
 
-    u32 vararg_count = 0;
-    u32 vararg_offset = 0xffffffff;
-    u64 stack_top_store_local;
+    // Because it would be inefficient to increment and decrement the global stack pointer for every argument,
+    // a simple set of instructions increments it once to the size it will need to be. However, because it is
+    // impossible to know what size the reserved memory will be, a location patch is taken in order to fill it
+    // in later.
+    u32 reserve_space_patch = bh_arr_length(code);
+    WID(WI_GLOBAL_GET, stack_top_idx);
+    WIL(WI_LOCAL_TEE, stack_top_store_local);
+    WID(WI_PTR_CONST, 0);                           // This will be filled in later.
+    WI(WI_PTR_ADD);
+    WID(WI_GLOBAL_SET, stack_top_idx);
+
+    u32 reserve_size  = 0;
+    u32 vararg_count  = 0;
+    i32 vararg_offset = -1;
 
     bh_arr_each(AstTyped *, parg, call->args.values) {
         AstArgument* arg = (AstArgument *) *parg;
         if (arg->is_baked) continue;
 
-        b32 place_on_stack  = 0;
+        b32 place_on_stack = 0;
 
-        if (arg->va_kind != VA_Kind_Not_VA) {
-            if (vararg_offset == 0xffffffff) vararg_offset = stack_grow_amm;
+        if (type_get_param_pass(arg->value->type) == Param_Pass_By_Implicit_Pointer) {
+            // This arguments needs to be written to the stack because it is not a simple structure.
             place_on_stack = 1;
         }
-        if (type_get_param_pass(arg->value->type) == Param_Pass_By_Implicit_Pointer) place_on_stack = 1;
 
-        if (place_on_stack) WID(WI_GLOBAL_GET, stack_top_idx);
+        if (arg->va_kind != VA_Kind_Not_VA) {
+            // This is a variadic argument and needs to be written to the stack. If the starting
+            // location of the vararg array hasn't been noted, note it.
+            if (vararg_offset < 0) vararg_offset = reserve_size;
 
-        if (stack_grow_amm != 0) {
-            stack_top_store_local = local_raw_allocate(mod->local_alloc, WASM_TYPE_PTR);
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WIL(WI_LOCAL_SET, stack_top_store_local);
-
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WID(WI_PTR_CONST, stack_grow_amm);
-            WI(WI_PTR_ADD);
-            WID(WI_GLOBAL_SET, stack_top_idx);
+            place_on_stack = 1;
+            vararg_count += 1;
         }
+
+        if (place_on_stack) WIL(WI_LOCAL_GET, stack_top_store_local);
 
         emit_expression(mod, &code, arg->value);
 
-        if (stack_grow_amm != 0) {
-            WIL(WI_LOCAL_GET, stack_top_store_local);
-            WID(WI_GLOBAL_SET, stack_top_idx);
-
-            local_raw_free(mod->local_alloc, WASM_TYPE_PTR);
-        }
-
         if (place_on_stack) {
-            emit_store_instruction(mod, &code, arg->value->type, stack_grow_amm);
+            emit_store_instruction(mod, &code, arg->value->type, reserve_size);
 
-            if (arg->va_kind != VA_Kind_Not_VA) vararg_count += 1;
-            else {
-                WID(WI_GLOBAL_GET, stack_top_idx);
-                WID(WI_PTR_CONST, stack_grow_amm);
+            if (arg->va_kind == VA_Kind_Not_VA) {
+                // Non-variadic arguments on the stack need a pointer to them placed on the WASM stack.
+                WIL(WI_LOCAL_GET, stack_top_store_local);
+                WID(WI_PTR_CONST, reserve_size);
                 WI(WI_PTR_ADD);
             }
 
-            stack_grow_amm += type_size_of(arg->value->type);
+            reserve_size += type_size_of(arg->value->type);
         }
     }
 
     switch (call->va_kind) {
         case VA_Kind_Typed: {
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WID(WI_PTR_CONST, vararg_offset);
-            WI(WI_PTR_ADD);
+            WIL(WI_LOCAL_GET, stack_top_store_local);
+            if (vararg_offset > 0) {
+                WID(WI_PTR_CONST, vararg_offset);
+                WI(WI_PTR_ADD);
+            }
             WID(WI_I32_CONST, vararg_count);
             break;
         }
 
         case VA_Kind_Untyped: {
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WID(WI_PTR_CONST, vararg_offset);
-            WI(WI_PTR_ADD);
-            emit_store_instruction(mod, &code, &basic_types[Basic_Kind_Rawptr], stack_grow_amm);
+            WIL(WI_LOCAL_GET, stack_top_store_local);
+            WIL(WI_LOCAL_GET, stack_top_store_local);
+            if (vararg_offset > 0) {
+                WID(WI_PTR_CONST, vararg_offset);
+                WI(WI_PTR_ADD);
+            }
+            emit_store_instruction(mod, &code, &basic_types[Basic_Kind_Rawptr], reserve_size);
 
             // NOTE: There will be 4 uninitialized bytes here, because pointers are only 4 bytes in WASM.
 
-            WID(WI_GLOBAL_GET, stack_top_idx);
+            WIL(WI_LOCAL_GET, stack_top_store_local);
             WID(WI_I32_CONST, vararg_count);
-            emit_store_instruction(mod, &code, &basic_types[Basic_Kind_I32], stack_grow_amm + 8);
+            emit_store_instruction(mod, &code, &basic_types[Basic_Kind_I32], reserve_size + 8);
 
-            WID(WI_GLOBAL_GET, stack_top_idx);
-            WID(WI_PTR_CONST, stack_grow_amm);
-            WI(WI_PTR_ADD);
+            WIL(WI_LOCAL_GET, stack_top_store_local);
+            if (reserve_size > 0) {
+                WID(WI_PTR_CONST, reserve_size);
+                WI(WI_PTR_ADD);
+            }
 
-            stack_grow_amm += 12;
+            reserve_size += 12;
             break;
         }
-
-        default: break;
     }
 
     CallingConvention cc = type_function_get_cc(call->callee->type);
     assert(cc != CC_Undefined);
 
-    b32 needs_stack = (cc == CC_Return_Stack) || (stack_grow_amm > 0);
-
     Type* return_type = call->callee->type->Function.return_type;
     u32 return_size = type_size_of(return_type);
-    u32 return_align = type_alignment_of(return_type);
-    bh_align(return_size, return_align);
+    assert(return_size % type_alignment_of(return_type) == 0);
 
-    if (cc == CC_Return_Stack) {
-        bh_align(stack_grow_amm, return_align);
-        stack_grow_amm += return_size;
-    }
-
-    bh_align(stack_grow_amm, 16);
-
-    if (needs_stack) {
-        WID(WI_GLOBAL_GET, stack_top_idx);
-        WID(WI_PTR_CONST, stack_grow_amm);
-        WI(WI_PTR_ADD);
-        WID(WI_GLOBAL_SET, stack_top_idx);
-    }
+    if (cc == CC_Return_Stack) reserve_size += return_size;
 
     if (call->callee->kind == Ast_Kind_Function) {
         i32 func_idx = (i32) bh_imap_get(&mod->index_map, (u64) call->callee);
@@ -1449,18 +1486,23 @@ EMIT_FUNC(call, AstCall* call) {
         WID(WI_CALL_INDIRECT, ((WasmInstructionData) { type_idx, 0x00 }));
     }
 
-    if (needs_stack) {
-        WID(WI_GLOBAL_GET, stack_top_idx);
-        WID(WI_PTR_CONST, stack_grow_amm);
-        WI(WI_PTR_SUB);
+    if (reserve_size > 0) {
+        WIL(WI_LOCAL_GET,  stack_top_store_local);
         WID(WI_GLOBAL_SET, stack_top_idx);
+
+        bh_align(reserve_size, 16);
+        code[reserve_space_patch + 2].data.l = reserve_size;
+
+    } else {
+        fori (i, 0, 5) code[reserve_space_patch + i].type = WI_NOP;
     }
 
     if (cc == CC_Return_Stack) {
         WID(WI_GLOBAL_GET, stack_top_idx);
-        emit_load_instruction(mod, &code, return_type, stack_grow_amm - return_size);
+        emit_load_instruction(mod, &code, return_type, reserve_size - return_size);
     }
 
+    local_raw_free(mod->local_alloc, WASM_TYPE_PTR);
     *pcode = code;
 }
 
@@ -1856,31 +1898,31 @@ EMIT_FUNC(intrinsic_call, AstCall* call) {
     *pcode = code;
 }
 
-EMIT_FUNC(array_access_location, AstArrayAccess* aa, u64* offset_return) {
+EMIT_FUNC(subscript_location, AstSubscript* sub, u64* offset_return) {
     bh_arr(WasmInstruction) code = *pcode;
 
-    emit_expression(mod, &code, aa->expr);
-    if (aa->elem_size != 1) {
-        WID(WI_PTR_CONST, aa->elem_size);
+    emit_expression(mod, &code, sub->expr);
+    if (sub->elem_size != 1) {
+        WID(WI_PTR_CONST, sub->elem_size);
         WI(WI_PTR_MUL);
     }
 
     // CLEANUP: This is one dense clusterf**k of code...
     u64 offset = 0;
-    if (aa->addr->kind == Ast_Kind_Array_Access
-        && aa->addr->type->kind == Type_Kind_Array) {
-        emit_array_access_location(mod, &code, (AstArrayAccess *) aa->addr, &offset);
-    } else if (aa->addr->kind == Ast_Kind_Field_Access
-        && aa->addr->type->kind == Type_Kind_Array) {
-        emit_field_access_location(mod, &code, (AstFieldAccess *) aa->addr, &offset);
-    } else if ((aa->addr->kind == Ast_Kind_Local || aa->addr->kind == Ast_Kind_Param)
-        && aa->addr->type->kind == Type_Kind_Array) {
-        emit_local_location(mod, &code, (AstLocal *) aa->addr, &offset);
-    } else if (aa->addr->kind == Ast_Kind_Memres
-        && aa->addr->type->kind != Type_Kind_Array) {
-        emit_memory_reservation_location(mod, &code, (AstMemRes *) aa->addr);
+    if (sub->addr->kind == Ast_Kind_Subscript
+        && sub->addr->type->kind == Type_Kind_Array) {
+        emit_subscript_location(mod, &code, (AstSubscript *) sub->addr, &offset);
+    } else if (sub->addr->kind == Ast_Kind_Field_Access
+        && sub->addr->type->kind == Type_Kind_Array) {
+        emit_field_access_location(mod, &code, (AstFieldAccess *) sub->addr, &offset);
+    } else if ((sub->addr->kind == Ast_Kind_Local || sub->addr->kind == Ast_Kind_Param)
+        && sub->addr->type->kind == Type_Kind_Array) {
+        emit_local_location(mod, &code, (AstLocal *) sub->addr, &offset);
+    } else if (sub->addr->kind == Ast_Kind_Memres
+        && sub->addr->type->kind != Type_Kind_Array) {
+        emit_memory_reservation_location(mod, &code, (AstMemRes *) sub->addr);
     } else {
-        emit_expression(mod, &code, aa->addr);
+        emit_expression(mod, &code, sub->addr);
     }
 
     WI(WI_PTR_ADD);
@@ -1901,10 +1943,10 @@ EMIT_FUNC(field_access_location, AstFieldAccess* field, u64* offset_return) {
         source_expr = (AstTyped *) ((AstFieldAccess *) source_expr)->expr;
     }
 
-    if (source_expr->kind == Ast_Kind_Array_Access
+    if (source_expr->kind == Ast_Kind_Subscript
         && source_expr->type->kind != Type_Kind_Pointer) {
         u64 o2 = 0;
-        emit_array_access_location(mod, &code, (AstArrayAccess *) source_expr, &o2);
+        emit_subscript_location(mod, &code, (AstSubscript *) source_expr, &o2);
         offset += o2;
 
     } else if ((source_expr->kind == Ast_Kind_Local || source_expr->kind == Ast_Kind_Param)
@@ -1990,8 +2032,6 @@ EMIT_FUNC(compound_load, Type* type, u64 offset) {
 
 EMIT_FUNC(compound_store, Type* type, u64 offset, b32 location_first) {
     bh_arr(WasmInstruction) code = *pcode;
-    bh_arr(u64) temp_locals = NULL;
-    bh_arr_new(global_heap_allocator, temp_locals, 4);
 
     TypeWithOffset two;
 
@@ -1999,14 +2039,14 @@ EMIT_FUNC(compound_store, Type* type, u64 offset, b32 location_first) {
     if (location_first) WIL(WI_LOCAL_SET, loc_idx);
 
     i32 elem_count = type_linear_member_count(type);
+    u64 *temp_locals = bh_alloc_array(global_scratch_allocator, u64, elem_count);
+
     forir (i, elem_count - 1, 0) {
         type_linear_member_lookup(type, i, &two);
 
         WasmType wt = onyx_type_to_wasm_type(two.type);
-        u64 tmp_idx = local_raw_allocate(mod->local_alloc, wt);
-
-        bh_arr_push(temp_locals, tmp_idx);
-        WIL(WI_LOCAL_SET, tmp_idx);
+        temp_locals[i] = local_raw_allocate(mod->local_alloc, wt);
+        WIL(WI_LOCAL_SET, temp_locals[i]);
     }
 
     if (!location_first) WIL(WI_LOCAL_SET, loc_idx);
@@ -2014,7 +2054,7 @@ EMIT_FUNC(compound_store, Type* type, u64 offset, b32 location_first) {
     fori (i, 0, elem_count) {
         type_linear_member_lookup(type, i, &two);
 
-        u64 tmp_idx = bh_arr_pop(temp_locals); 
+        u64 tmp_idx = temp_locals[i]; 
         WIL(WI_LOCAL_GET, loc_idx);
         WIL(WI_LOCAL_GET, tmp_idx);
         emit_store_instruction(mod, &code, two.type, offset + two.offset);
@@ -2023,8 +2063,10 @@ EMIT_FUNC(compound_store, Type* type, u64 offset, b32 location_first) {
         local_raw_free(mod->local_alloc, wt);
     }
 
-    bh_arr_free(temp_locals);
     local_raw_free(mod->local_alloc, WASM_TYPE_PTR);
+
+    // This shouldn't be necessary because the scratch allocator doesn't free.
+    bh_free(global_scratch_allocator, temp_locals);
 
     *pcode = code;
 }
@@ -2056,20 +2098,70 @@ EMIT_FUNC(array_store, Type* type, u32 offset) {
     WIL(WI_LOCAL_SET, rptr_local);
     WIL(WI_LOCAL_SET, lptr_local);
 
-    // NOTE: Currently, we inline the copying of the array; But if the array has
-    // many elements, this could result in a LOT of instructions. Maybe for lengths
-    // greater than like 16 we output a loop that copies them?
-    //                                               - brendanfh 2020/12/16
-    fori (i, 0, elem_count) {
-        WIL(WI_LOCAL_GET, lptr_local);
+    if (elem_count <= 2) {
+        // Inline copying for a small number of elements. It still may be faster to do this in a tight loop.
 
-        if (bh_arr_last(code).type == WI_LOCAL_SET && (u64) bh_arr_last(code).data.l == rptr_local)
+        fori (i, 0, elem_count) {
+            if (bh_arr_last(code).type == WI_LOCAL_SET && (u64) bh_arr_last(code).data.l == lptr_local)
+                bh_arr_last(code).type = WI_LOCAL_TEE;
+            else
+                WIL(WI_LOCAL_GET, lptr_local);
+
+            WIL(WI_LOCAL_GET, rptr_local);
+            emit_load_instruction(mod, &code, elem_type, i * elem_size);
+
+            emit_store_instruction(mod, &code, elem_type, i * elem_size + offset);
+        }
+
+    } else if (context.options->use_post_mvp_features) {
+        // Use a simple memory copy if it is available. This may be what happens in the case below too at a later time.
+
+        if (bh_arr_last(code).type == WI_LOCAL_SET && (u64) bh_arr_last(code).data.l == lptr_local)
             bh_arr_last(code).type = WI_LOCAL_TEE;
         else
-            WIL(WI_LOCAL_GET, rptr_local);
-        emit_load_instruction(mod, &code, elem_type, i * elem_size);
+            WIL(WI_LOCAL_GET, lptr_local);
+        WIL(WI_PTR_CONST, offset);
+        WI(WI_PTR_ADD);
 
-        emit_store_instruction(mod, &code, elem_type, i * elem_size + offset);
+        WIL(WI_LOCAL_GET, rptr_local);
+        WIL(WI_I32_CONST, elem_count * elem_size);
+        WI(WI_MEMORY_COPY);
+
+    } else {
+        // Emit a loop that copies the memory. This could be switched to a tight loop that just copies word per word.
+
+        u64 offset_local = local_raw_allocate(mod->local_alloc, WASM_TYPE_PTR);
+        WIL(WI_PTR_CONST, 0);
+        WIL(WI_LOCAL_SET, offset_local);
+
+        WID(WI_BLOCK_START, 0x40);
+        WID(WI_LOOP_START, 0x40);
+            WIL(WI_LOCAL_GET, offset_local);
+            WIL(WI_LOCAL_GET, lptr_local);
+            WI(WI_PTR_ADD);
+
+            WIL(WI_LOCAL_GET, offset_local);
+            WIL(WI_LOCAL_GET, rptr_local);
+            WI(WI_PTR_ADD);
+
+            emit_load_instruction(mod, &code, elem_type, 0);
+            emit_store_instruction(mod, &code, elem_type, offset);
+
+            WIL(WI_LOCAL_GET, offset_local);
+            WIL(WI_PTR_CONST, elem_size);
+            WI(WI_PTR_ADD);
+            WIL(WI_LOCAL_TEE, offset_local);
+
+            WIL(WI_PTR_CONST, elem_count * elem_size);
+            WI(WI_PTR_GE);
+            WID(WI_COND_JUMP, 0x01);
+
+            WID(WI_JUMP, 0x00);
+
+        WI(WI_LOOP_END);
+        WI(WI_BLOCK_END);
+
+        local_raw_free(mod->local_alloc, WASM_TYPE_PTR);
     }
 
     local_raw_free(mod->local_alloc, WASM_TYPE_PTR);
@@ -2128,9 +2220,9 @@ EMIT_FUNC(location_return_offset, AstTyped* expr, u64* offset_return) {
             break;
         }
 
-        case Ast_Kind_Array_Access: {
-            AstArrayAccess* aa = (AstArrayAccess *) expr;
-            emit_array_access_location(mod, &code, aa, offset_return);
+        case Ast_Kind_Subscript: {
+            AstSubscript* sub = (AstSubscript *) expr;
+            emit_subscript_location(mod, &code, sub, offset_return);
             break;
         }
 
@@ -2171,6 +2263,14 @@ EMIT_FUNC(location, AstTyped* expr) {
 
 EMIT_FUNC(expression, AstTyped* expr) {
     bh_arr(WasmInstruction) code = *pcode;
+
+    if (node_is_type((AstNode *) expr)) {
+        Type* type = type_build_from_ast(context.ast_alloc, (AstType *) expr);
+        WID(WI_I32_CONST, type->id);
+
+        *pcode = code;
+        return;
+    }
 
     switch (expr->kind) {
         case Ast_Kind_Param: {
@@ -2305,11 +2405,11 @@ EMIT_FUNC(expression, AstTyped* expr) {
             break;
         }
 
-        case Ast_Kind_Array_Access: {
-            AstArrayAccess* aa = (AstArrayAccess *) expr;
+        case Ast_Kind_Subscript: {
+            AstSubscript* sub = (AstSubscript *) expr;
             u64 offset = 0;
-            emit_array_access_location(mod, &code, aa, &offset);
-            emit_load_instruction(mod, &code, aa->type, offset);
+            emit_subscript_location(mod, &code, sub, &offset);
+            emit_load_instruction(mod, &code, sub->type, offset);
             break;
         }
 
@@ -2324,51 +2424,60 @@ EMIT_FUNC(expression, AstTyped* expr) {
                 }
             }
 
+            if (is_lval((AstNode *) field->expr) || type_is_pointer(field->expr->type)) {
+                u64 offset = 0;
+                emit_field_access_location(mod, &code, field, &offset);
+                emit_load_instruction(mod, &code, field->type, offset);
 
-            // HACK
-            // This is only used in the weird case where you write something like this:
-            //
-            //    data_ptr := "Test string".data;
-            //    string_count := "Some other string".count;
-            //
-            // I don't think this is every used in the core libraries or anything written in
-            // Onyx yet, so this might go away at some point. Actually, thinking about it,
-            // I think accessing fields on r-values is completely disabled currently, so this
-            // is never possible.
-            //
-            // I think a more general case of accessing fields on r-values is better. For example,
-            //
-            //     returns_foo :: () -> Foo { ... }
-            //
-            //     value := returns_foo().foo_member;
-            //
-            // This does not work in the language at the moment, but maybe should?
-            /*
-            else if (field->expr->kind == Ast_Kind_StrLit) {
-                StructMember smem;
+            } else {
+                emit_expression(mod, &code, field->expr);
 
-                token_toggle_end(field->token);
-                type_lookup_member(field->expr->type, field->token->text, &smem);
-                token_toggle_end(field->token);
+                i32 idx = type_get_idx_of_linear_member_with_offset(field->expr->type, field->offset);
+                i32 field_linear_members = type_linear_member_count(field->type);
+                i32 total_linear_members = type_linear_member_count(field->expr->type);
 
-                if (smem.idx == 0)
-                    WID(WI_I32_CONST, ((AstStrLit *) field->expr)->addr);
+                if (idx == 0) {
+                    // Easy case: the member is the first one and all other members just have to be dropped.
+                    fori (i, 0, total_linear_members - field_linear_members) WI(WI_DROP);
 
-                if (smem.idx == 1)
-                    WID(WI_I32_CONST, ((AstStrLit *) field->expr)->length);
+                } else {
+                    // Tough case: Stack shuffling to make the member the only thing on the stack.
+                    // This is very similar to the compound_load/compound_store procedures but it is different enough
+                    // that I cannot find a good way to factor them all without just introducing a ton of complexity.
+                    fori (i, 0, total_linear_members - idx - field_linear_members) WI(WI_DROP);
 
-                break;
+                    u64 *temporaries = bh_alloc_array(global_scratch_allocator, u64, field_linear_members);
+                    fori (i, 0, field_linear_members) temporaries[i] = 0;
+
+                    TypeWithOffset two = { 0 };
+                    forir (i, field_linear_members - 1, 0) {
+                        type_linear_member_lookup(field->type, i, &two);
+
+                        WasmType wt = onyx_type_to_wasm_type(two.type);
+                        temporaries[i] = local_raw_allocate(mod->local_alloc, wt);
+                        WIL(WI_LOCAL_SET, temporaries[i]);
+                    }
+
+                    fori (i, 0, idx) WI(WI_DROP);
+
+                    fori (i, 0, field_linear_members) {
+                        type_linear_member_lookup(field->type, i, &two);
+
+                        WIL(WI_LOCAL_GET, temporaries[i]);
+
+                        WasmType wt = onyx_type_to_wasm_type(two.type);
+                        local_raw_free(mod->local_alloc, wt);
+                    }
+
+                    bh_free(global_scratch_allocator, temporaries);
+                }
             }
-            */
 
-            u64 offset = 0;
-            emit_field_access_location(mod, &code, field, &offset);
-            emit_load_instruction(mod, &code, field->type, offset);
             break;
         }
 
         case Ast_Kind_Slice: {
-            AstArrayAccess* sl = (AstArrayAccess *) expr;
+            AstSubscript* sl = (AstSubscript *) expr;
 
             emit_expression(mod, &code, sl->expr);
 
@@ -2438,6 +2547,15 @@ EMIT_FUNC(expression, AstTyped* expr) {
             break;
         }
 
+        case Ast_Kind_Call_Site: {
+            AstCallSite* callsite = (AstCallSite *) expr;
+
+            emit_expression(mod, &code, (AstTyped *) callsite->filename);
+            emit_expression(mod, &code, (AstTyped *) callsite->line);
+            emit_expression(mod, &code, (AstTyped *) callsite->column);
+            break;
+        }
+
         default:
             bh_printf("Unhandled case: %d\n", expr->kind);
             DEBUG_HERE;
@@ -2453,19 +2571,20 @@ EMIT_FUNC(expression, AstTyped* expr) {
     *pcode = code;
 }
 
-static const WasmInstructionType cast_map[][11] = {
+static const WasmInstructionType cast_map[][12] = {
     //          I8              U8                  I16                 U16                I32                 U32                I64                U64                F32                F64                PTR
-    /* I8  */ { WI_NOP,         WI_NOP,             WI_I32_EXTEND_8_S,  WI_NOP,            WI_I32_EXTEND_8_S,  WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE },
-    /* U8  */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE },
-    /* I16 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_I32_EXTEND_16_S, WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE },
-    /* U16 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE },
-    /* I32 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_F32_FROM_I32_S, WI_F64_FROM_I32_S, WI_NOP },
-    /* U32 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_F32_FROM_I32_U, WI_F64_FROM_I32_U, WI_NOP },
-    /* I64 */ { WI_NOP,         WI_I32_FROM_I64,    WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_NOP,            WI_NOP,            WI_F32_FROM_I64_S, WI_F64_FROM_I64_S, WI_I32_FROM_I64 },
-    /* U64 */ { WI_NOP,         WI_I32_FROM_I64,    WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_NOP,            WI_NOP,            WI_F32_FROM_I64_U, WI_F64_FROM_I64_U, WI_I32_FROM_I64 },
-    /* F32 */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_I32_FROM_F32_S,  WI_I32_FROM_F32_U, WI_I64_FROM_F32_S, WI_I64_FROM_F32_U, WI_NOP,            WI_F64_FROM_F32,   WI_UNREACHABLE },
-    /* F64 */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_I32_FROM_F64_S,  WI_I32_FROM_F64_U, WI_I64_FROM_F64_S, WI_I64_FROM_F64_U, WI_F32_FROM_F64,   WI_NOP,            WI_UNREACHABLE },
-    /* PTR */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_NOP },
+    /* I8  */ { WI_NOP,         WI_NOP,             WI_I32_EXTEND_8_S,  WI_NOP,            WI_I32_EXTEND_8_S,  WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* U8  */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* I16 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_I32_EXTEND_16_S, WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* U16 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* I32 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_S, WI_I64_FROM_I32_S, WI_F32_FROM_I32_S, WI_F64_FROM_I32_S, WI_NOP,          WI_NOP         },
+    /* U32 */ { WI_NOP,         WI_NOP,             WI_NOP,             WI_NOP,            WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_F32_FROM_I32_U, WI_F64_FROM_I32_U, WI_NOP,          WI_NOP         },
+    /* I64 */ { WI_NOP,         WI_I32_FROM_I64,    WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_NOP,            WI_NOP,            WI_F32_FROM_I64_S, WI_F64_FROM_I64_S, WI_I32_FROM_I64, WI_UNREACHABLE },
+    /* U64 */ { WI_NOP,         WI_I32_FROM_I64,    WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_I32_FROM_I64,    WI_I32_FROM_I64,   WI_NOP,            WI_NOP,            WI_F32_FROM_I64_U, WI_F64_FROM_I64_U, WI_I32_FROM_I64, WI_UNREACHABLE },
+    /* F32 */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_I32_FROM_F32_S,  WI_I32_FROM_F32_U, WI_I64_FROM_F32_S, WI_I64_FROM_F32_U, WI_NOP,            WI_F64_FROM_F32,   WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* F64 */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_I32_FROM_F64_S,  WI_I32_FROM_F64_U, WI_I64_FROM_F64_S, WI_I64_FROM_F64_U, WI_F32_FROM_F64,   WI_NOP,            WI_UNREACHABLE,  WI_UNREACHABLE },
+    /* PTR */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_NOP,             WI_NOP,            WI_I64_FROM_I32_U, WI_I64_FROM_I32_U, WI_UNREACHABLE,    WI_UNREACHABLE,    WI_NOP,          WI_UNREACHABLE },
+    /* TYP */ { WI_UNREACHABLE, WI_UNREACHABLE,     WI_UNREACHABLE,     WI_UNREACHABLE,    WI_NOP,             WI_NOP,            WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,    WI_UNREACHABLE,  WI_NOP         },
 };
 
 EMIT_FUNC(cast, AstUnaryOp* cast) {
@@ -2508,6 +2627,12 @@ EMIT_FUNC(cast, AstUnaryOp* cast) {
         if      (from->Basic.size == 4) fromidx = 8;
         else if (from->Basic.size == 8) fromidx = 9;
     }
+    else if (from->Basic.flags & Basic_Flag_Boolean) {
+        fromidx = 0;
+    }
+    else if (from->Basic.flags & Basic_Flag_Type_Index) {
+        fromidx = 11;
+    }
 
     if (to->Basic.flags & Basic_Flag_Pointer || to->kind == Type_Kind_Array) {
         toidx = 10;
@@ -2520,6 +2645,12 @@ EMIT_FUNC(cast, AstUnaryOp* cast) {
     else if (to->Basic.flags & Basic_Flag_Float) {
         if      (to->Basic.size == 4) toidx = 8;
         else if (to->Basic.size == 8) toidx = 9;
+    }
+    else if (to->Basic.flags & Basic_Flag_Boolean) {
+        toidx = 0;
+    }
+    else if (to->Basic.flags & Basic_Flag_Type_Index) {
+        toidx = 11;
     }
 
     if (fromidx != -1 && toidx != -1) {
@@ -2627,8 +2758,6 @@ EMIT_FUNC(zero_value_for_type, Type* type, OnyxToken* where) {
 
     }
     else if (type->kind == Type_Kind_Function) {
-        // CLEANUP ROBUSTNESS: This should use the 'null_proc' instead of whatever is at
-        // function index 0.
         WID(WI_I32_CONST, mod->null_proc_func_idx);
     }
     else {
@@ -3060,6 +3189,13 @@ static void emit_memory_reservation(OnyxWasmModule* mod, AstMemRes* memres) {
     u64 alignment = type_alignment_of(effective_type);
     u64 size = type_size_of(effective_type);
 
+    if (type_table_node != NULL && (AstMemRes *) type_table_node == memres) {
+        u64 table_location = build_type_table(mod);
+        memres->addr = table_location;
+
+        return;
+    }
+
     u32 offset = mod->next_datum_offset;
     bh_align(offset, alignment);
 
@@ -3199,7 +3335,6 @@ OnyxWasmModule onyx_wasm_module_create(bh_allocator alloc) {
     bh_arr_new(alloc, module.data, 4);
     bh_arr_new(alloc, module.elems, 4);
 
-    // NOTE: 16 is probably needlessly large
     bh_arr_new(global_heap_allocator, module.structured_jump_target, 16);
     bh_arr_set_length(module.structured_jump_target, 0);
 
@@ -3303,6 +3438,19 @@ void emit_entity(Entity* ent) {
 
         case Entity_Type_Function: emit_function(module, ent->function); break;
         case Entity_Type_Global:   emit_global(module,   ent->global); break;
+
+        // Cleanup: Maybe these should be printed elsewhere?
+        // Also, they should be sorted? Or have that ability?
+        case Entity_Type_Note: {
+            if (!context.options->print_notes) break;
+
+            AstNote* note = (AstNote *) ent->expr;
+            OnyxFilePos pos = note->token->pos;
+
+            bh_printf("Note: %b %s:%d:%d\n", note->token->text, note->token->length, pos.filename, pos.line, pos.column);
+
+            break;
+        }
 
         default: break;
     }

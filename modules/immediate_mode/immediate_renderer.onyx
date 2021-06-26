@@ -23,6 +23,7 @@ Immediate_Renderer :: struct {
     active_shader : ^Shader;
 
     simple_shader, textured_shader : Shader;
+    alpha_shader : Shader;
 
     // 'verticies' contains the vertex data and the maximum number of verticies
     // that can be rendered at a given time. 'vertex_count' is used to store how
@@ -50,9 +51,11 @@ Immediate_Renderer :: struct {
         IMMEDIATE_VERTEX_SHADER            :: #file_contents "./shaders/basic_vertex.glsl"
         IMMEDIATE_FRAGMENT_SHADER          :: #file_contents "./shaders/basic_fragment.glsl"
         IMMEDIATE_FRAGMENT_SHADER_TEXTURED :: #file_contents "./shaders/textured_fragment.glsl"
+        IMMEDIATE_ALPHA_SHADER             :: #file_contents "./shaders/alpha_fragment.glsl"
 
         simple_shader   = Shader.make_from_source(IMMEDIATE_VERTEX_SHADER, IMMEDIATE_FRAGMENT_SHADER);
         textured_shader = Shader.make_from_source(IMMEDIATE_VERTEX_SHADER, IMMEDIATE_FRAGMENT_SHADER_TEXTURED);
+        alpha_shader    = Shader.make_from_source(IMMEDIATE_VERTEX_SHADER, IMMEDIATE_ALPHA_SHADER);
         active_shader   = ^simple_shader;
 
         verticies = memory.make_slice(Immediate_Vertex, max_verticies);
@@ -66,6 +69,7 @@ Immediate_Renderer :: struct {
         
         ir->init_shader_params(^simple_shader);
         ir->init_shader_params(^textured_shader);
+        ir->init_shader_params(^alpha_shader);
 
         gl.useProgram(active_shader.program);
     }
@@ -103,6 +107,7 @@ Immediate_Renderer :: struct {
     free :: (use ir: ^Immediate_Renderer) {
         simple_shader->free();
         textured_shader->free();
+        alpha_shader->free();
 
         gl.deleteVertexArray(vertex_array);
         gl.deleteBuffer(vertex_buffer);
@@ -123,7 +128,7 @@ Immediate_Renderer :: struct {
         vertex_count = 0;
     }
 
-    push_vertex :: proc {
+    push_vertex :: #match {
         // If a color is not provided, the previous color is used.
         (use ir: ^Immediate_Renderer, position: Vector2) {
             push_vertex(ir, position, color = verticies[vertex_count - 1].color);
@@ -171,12 +176,57 @@ Immediate_Renderer :: struct {
         vertex_ptr[5] = .{ .{ position.x,          position.y + size.y }, color, .{ texture_position.x,                   texture_position.y + texture_size.y } };
     }
 
+    circle :: (use ir: ^Immediate_Renderer, center: Vector2, radius: f32, color := Color4.{ 1, 1, 1 }, segments := 12) {
+        if vertex_count >= verticies.count - segments * 3 do ir->flush();
+
+        assert(verticies.count >= segments * 3, "[Immediate Renderer] Too many segments to draw in a single call.");
+
+        vertex_ptr := ^verticies[vertex_count];
+        defer vertex_count += segments * 3;
+
+        cx := center.x;
+        cy := center.y;
+
+        px := radius + cx;
+        py := cy;
+
+        ptr_offset := 0;
+
+        for s: 1 .. segments + 1 {
+            angle := math.PI * 2 * cast(f32) s / ~~segments;
+            x     := math.cos(angle) * radius + cx;
+            y     := math.sin(angle) * radius + cy;
+
+            vertex_ptr[ptr_offset + 0] = .{ .{ cx, cy }, color, .{ 0, 0 } };
+            vertex_ptr[ptr_offset + 1] = .{ .{ px, py }, color, .{ 0, 0 } };
+            vertex_ptr[ptr_offset + 2] = .{ .{  x,  y }, color, .{ 0, 0 } };
+
+            px = x;
+            py = y;
+            ptr_offset += 3;
+        }
+    }
+
     // NOTE: Calling set_texture without a parameter will disable textured rendering.
     set_texture :: (use ir: ^Immediate_Renderer, texture_id: i32 = -1) {
         if vertex_count > 0 do flush(ir);
 
+        previous_active := active_shader;
         if texture_id >= 0 do active_shader = ^textured_shader;
         else               do active_shader = ^simple_shader;
+
+        // Skip the GL calls if the texture didn't change.
+        if previous_active == active_shader do return;
+
+        gl.useProgram(active_shader.program);
+        gl.uniform1i(active_shader.texture_uniform, math.max(texture_id, 0));
+    }
+
+    use_alpha_shader :: (use ir: ^Immediate_Renderer, texture_id: i32 = -1) {
+        if active_shader != ^alpha_shader {
+            if vertex_count > 0 do flush(ir);
+            active_shader = ^alpha_shader;
+        }
 
         gl.useProgram(active_shader.program);
         gl.uniform1i(active_shader.texture_uniform, math.max(texture_id, 0));
@@ -184,18 +234,38 @@ Immediate_Renderer :: struct {
 
     use_ortho_projection :: (use ir: ^Immediate_Renderer, left: f32, right: f32, top: f32, bottom: f32) {
         projection_matrix := f32.[
-            2 / (right - left), 0, 0, -(right + left) / (right - left),
-            0, 2 / (top - bottom), 0, -(top + bottom) / (top - bottom),
-            0, 0, -2, -1,
-            0, 0, 0, 1
+            2 / (right - left), 0, 0, 0,
+            0, 2 / (top - bottom), 0, 0,
+            0, 0, -2, 0,
+            -(right + left) / (right - left), -(top + bottom) / (top - bottom), -1, 1
         ];
 
         gl.useProgram(simple_shader.program);
-        gl.uniformMatrix4(simple_shader.view_uniform, true, projection_matrix);
+        gl.uniformMatrix4(simple_shader.view_uniform, false, projection_matrix);
         gl.useProgram(textured_shader.program);
-        gl.uniformMatrix4(textured_shader.view_uniform, true, projection_matrix);
+        gl.uniformMatrix4(textured_shader.view_uniform, false, projection_matrix);
+        gl.useProgram(alpha_shader.program);
+        gl.uniformMatrix4(alpha_shader.view_uniform, false, projection_matrix);
 
         gl.useProgram(active_shader.program);
+    }
+
+    @Cleanup // right now, these are raw screen coordinates, with x and y being the bottom left of the screen.
+    // This is backwards from what use_ortho_projections does, so it's not great to work with.
+    scissor :: (use ir: ^Immediate_Renderer, x: f32, y: f32, w: f32, h: f32) {
+        if !gl.isEnabled(gl.SCISSOR_TEST) {
+            ir->flush();
+            gl.enable(gl.SCISSOR_TEST);
+        }
+
+        gl.scissor(~~x, ~~y, ~~w, ~~h);
+    }
+
+    scissor_disable :: (use ir: ^Immediate_Renderer) {
+        if gl.isEnabled(gl.SCISSOR_TEST) {
+            ir->flush();
+            gl.disable(gl.SCISSOR_TEST);
+        }
     }
 }
 
@@ -217,7 +287,7 @@ immediate_renderer_free :: () {
     Immediate_Renderer.free(^immediate_renderer);
 }
 
-vertex :: proc {
+vertex :: #match {
     (position: Vector2)                { immediate_renderer->push_vertex(position); },
     (position: Vector2, color: Color4) { immediate_renderer->push_vertex(position, color); },
 }
@@ -230,10 +300,26 @@ textured_rect :: (position: Vector2, size: Vector2, texture_position: Vector2, t
     immediate_renderer->textured_rect(position, size, texture_position, texture_size, color);
 }
 
+circle :: (center: Vector2, radius: f32, color: Color4 = .{1,1,1}, segments := 12) {
+    immediate_renderer->circle(center, radius, color, segments);
+}
+
 flush :: () do immediate_renderer->flush();
 
 set_texture :: (texture_id: i32 = -1) do immediate_renderer->set_texture(texture_id);
 
 use_ortho_projection :: (left: f32, right: f32, top: f32, bottom: f32) {
     immediate_renderer->use_ortho_projection(left, right, top, bottom);
+}
+
+use_alpha_shader :: (texture_id: i32 = -1) {
+    immediate_renderer->use_alpha_shader(texture_id);
+}
+
+scissor :: (x: f32, y: f32, w: f32, h: f32) {
+    immediate_renderer->scissor(x, y, w, h);
+}
+
+scissor_disable :: () {
+    immediate_renderer->scissor_disable();
 }

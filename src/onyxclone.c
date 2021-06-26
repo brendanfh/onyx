@@ -34,7 +34,6 @@ static inline i32 ast_kind_to_size(AstNode* node) {
         case Ast_Kind_Overloaded_Function: return sizeof(AstOverloadedFunction);
         case Ast_Kind_Polymorphic_Proc: return sizeof(AstPolyProc);
         case Ast_Kind_Block: return sizeof(AstBlock);
-        case Ast_Kind_Local_Group: return sizeof(AstNode);
         case Ast_Kind_Local: return sizeof(AstLocal);
         case Ast_Kind_Global: return sizeof(AstGlobal);
         case Ast_Kind_Symbol: return sizeof(AstNode);
@@ -68,9 +67,10 @@ static inline i32 ast_kind_to_size(AstNode* node) {
         case Ast_Kind_Return: return sizeof(AstReturn);
         case Ast_Kind_Address_Of: return sizeof(AstAddressOf);
         case Ast_Kind_Dereference: return sizeof(AstDereference);
-        case Ast_Kind_Array_Access: return sizeof(AstArrayAccess);
-        case Ast_Kind_Slice: return sizeof(AstArrayAccess);
+        case Ast_Kind_Subscript: return sizeof(AstSubscript);
+        case Ast_Kind_Slice: return sizeof(AstSubscript);
         case Ast_Kind_Field_Access: return sizeof(AstFieldAccess);
+        case Ast_Kind_Unary_Field_Access: return sizeof(AstUnaryFieldAccess);
         case Ast_Kind_Pipe: return sizeof(AstBinaryOp);
         case Ast_Kind_Range_Literal: return sizeof(AstRangeLiteral);
         case Ast_Kind_Method_Call: return sizeof(AstBinaryOp);
@@ -90,6 +90,8 @@ static inline i32 ast_kind_to_size(AstNode* node) {
         case Ast_Kind_Directive_Solidify: return sizeof(AstDirectiveSolidify);
         case Ast_Kind_Compound: return sizeof(AstCompound);
         case Ast_Kind_Named_Value: return sizeof(AstNamedValue);
+        case Ast_Kind_Call_Site: return sizeof(AstCallSite);
+        case Ast_Kind_Static_If: return sizeof(AstIfWhile);
         case Ast_Kind_Count: return 0;
 	}
 
@@ -162,9 +164,9 @@ AstNode* ast_clone(bh_allocator a, void* n) {
 			break;
 
 		case Ast_Kind_Slice:
-		case Ast_Kind_Array_Access:
-			((AstArrayAccess *) nn)->addr = (AstTyped *) ast_clone(a, ((AstArrayAccess *) node)->addr);
-			((AstArrayAccess *) nn)->expr = (AstTyped *) ast_clone(a, ((AstArrayAccess *) node)->expr);
+		case Ast_Kind_Subscript:
+			((AstSubscript *) nn)->addr = (AstTyped *) ast_clone(a, ((AstSubscript *) node)->addr);
+			((AstSubscript *) nn)->expr = (AstTyped *) ast_clone(a, ((AstSubscript *) node)->expr);
 			break;
 
 		case Ast_Kind_Field_Access:
@@ -236,6 +238,7 @@ AstNode* ast_clone(bh_allocator a, void* n) {
 				((AstIfWhile *) nn)->assignment->left = (AstTyped *) ((AstIfWhile *) nn)->local;
 
 			((AstIfWhile *) nn)->cond = (AstTyped *) ast_clone(a, ((AstIfWhile *) node)->cond);
+		case Ast_Kind_Static_If:
 			((AstIfWhile *) nn)->true_stmt = (AstBlock *) ast_clone(a, ((AstIfWhile *) node)->true_stmt);
 			((AstIfWhile *) nn)->false_stmt = (AstBlock *) ast_clone(a, ((AstIfWhile *) node)->false_stmt);
 			break;

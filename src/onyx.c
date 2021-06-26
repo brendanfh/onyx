@@ -43,10 +43,13 @@ static const char* docstring = "Onyx compiler version " VERSION "\n"
     "\t           -VV          Very verbose output\n"
     "\t           -VVV         Very very verbose output (to be used by compiler developers)\n"
     "\t--use-post-mvp-features Enables post MVP WASM features such as memory.copy and memory.fill\n"
+    "\t--doc <doc_file>"
     "\n"
     "Developer flags:\n"
     "\t--print-function-mappings Prints a mapping from WASM function index to source location.\n"
     "\t--print-static-if-results Prints the conditional result of each #if statement. Useful for debugging.\n"
+    "\t--print-notes             Prints the location of notes throughout the loaded code.\n"
+    "\t--no-colors               Disables colors in the error message\n"
     "\n";
 
 
@@ -63,7 +66,9 @@ static CompileOptions compile_opts_parse(bh_allocator alloc, int argc, char *arg
         .runtime = Runtime_Wasi,
 
         .files = NULL,
-        .target_file = "out.c",
+        .target_file = "out.wasm",
+
+        .documentation_file = NULL,
     };
 
     bh_arr_new(alloc, options.files, 2);
@@ -75,13 +80,10 @@ static CompileOptions compile_opts_parse(bh_allocator alloc, int argc, char *arg
 
     if (argc == 1) return options;
 
-    if (!strcmp(argv[1], "help")) options.action = ONYX_COMPILE_ACTION_PRINT_HELP;
-    // else if (!strcmp(argv[1], "doc")) {
-    //     options.action = ONYX_COMPILE_ACTION_DOCUMENT;
-    // }
+    if (!strcmp(argv[1], "help"))     options.action = ONYX_COMPILE_ACTION_PRINT_HELP;
     else options.action = ONYX_COMPILE_ACTION_COMPILE;
 
-    if (options.action == ONYX_COMPILE_ACTION_COMPILE) {
+    if (options.action != ONYX_COMPILE_ACTION_PRINT_HELP) {
         fori(i, 1, argc) {
             if (!strcmp(argv[i], "-o")) {
                 options.target_file = argv[++i];
@@ -101,6 +103,12 @@ static CompileOptions compile_opts_parse(bh_allocator alloc, int argc, char *arg
             else if (!strcmp(argv[i], "--print-static-if-results")) {
                 options.print_static_if_results = 1;
             }
+            else if (!strcmp(argv[i], "--print-notes")) {
+                options.print_notes = 1;
+            }
+            else if (!strcmp(argv[i], "--no-colors")) {
+                options.no_colors = 1;
+            }
             else if (!strcmp(argv[i], "--use-post-mvp-features")) {
                 options.use_post_mvp_features = 1;
             }
@@ -116,6 +124,9 @@ static CompileOptions compile_opts_parse(bh_allocator alloc, int argc, char *arg
                     bh_printf("WARNING: '%s' is not a valid runtime. Defaulting to 'wasi'.\n", argv[i]);
                     options.runtime = Runtime_Wasi;
                 }
+            }
+            else if (!strcmp(argv[i], "--doc")) {
+                options.documentation_file = argv[++i];
             }
 #if defined(_BH_LINUX)
             // NOTE: Fun output is only enabled for Linux because Windows command line
@@ -159,6 +170,8 @@ static AstInclude* create_load(bh_allocator alloc, char* filename) {
 }
 
 static void context_init(CompileOptions* opts) {
+    types_init();
+
     context.options = opts;
     context.cycle_detected = 0;
 
@@ -190,6 +203,13 @@ static void context_init(CompileOptions* opts) {
         .type = Entity_Type_Load_File,
         .package = NULL,
         .include = create_load(context.ast_alloc, "core/builtin"),
+    }));
+
+    entity_heap_insert(&context.entities, ((Entity) {
+        .state = Entity_State_Parse_Builtin,
+        .type = Entity_Type_Load_File,
+        .package = NULL,
+        .include = create_load(context.ast_alloc, "core/type_info/type_info"),
     }));
     
     add_entities_for_node(NULL, (AstNode *) &builtin_stack_top, context.global_scope, NULL);
@@ -265,9 +285,11 @@ static void process_load_entity(Entity* ent) {
 }
 
 static b32 process_entity(Entity* ent) {
+    static char verbose_output_buffer[512];
     if (context.options->verbose_output == 3) {
         if (ent->expr && ent->expr->token)
-            printf("%s | %s (%d, %d) | %s:%i:%i\n",
+            snprintf(verbose_output_buffer, 511,
+                    "%20s | %24s (%d, %d) | %s:%i:%i \n",
                    entity_state_strings[ent->state],
                    entity_type_strings[ent->type],
                    (u32) ent->macro_attempts,
@@ -277,7 +299,8 @@ static b32 process_entity(Entity* ent) {
                    ent->expr->token->pos.column);
         
         else if (ent->expr)
-            printf("%s | %s (%d, %d) \n",
+            snprintf(verbose_output_buffer, 511,
+                    "%20s | %24s (%d, %d) \n",
                    entity_state_strings[ent->state],
                    entity_type_strings[ent->type],
                    (u32) ent->macro_attempts,
@@ -320,16 +343,18 @@ static b32 process_entity(Entity* ent) {
             ent->state = Entity_State_Finalized;
             break;
 
-        case Entity_State_Comptime_Resolve_Symbols:
         case Entity_State_Resolve_Symbols: symres_entity(ent); break;
-
-        case Entity_State_Comptime_Check_Types:
         case Entity_State_Check_Types:     check_entity(ent);  break;
-        
-        case Entity_State_Code_Gen:        emit_c_entity(ent);   break;
+        case Entity_State_Code_Gen:        emit_entity(ent);   break;
     }
 
-    return ent->state != before_state;
+    b32 changed = ent->state != before_state;
+    if (context.options->verbose_output == 3) {
+        if (changed) printf("SUCCESS | %s", verbose_output_buffer);
+        else         printf("YIELD   | %s", verbose_output_buffer);
+    }
+
+    return changed;
 }
 
 // Just having fun with some visual output - brendanfh 2020/12/14
@@ -339,8 +364,8 @@ static void output_dummy_progress_bar() {
     if (bh_arr_length(eh->entities) == 0) return;
 
     static const char* state_colors[] = {
-        "\e[91m", "\e[93m", "\e[94m", "\e[93m", "\e[97m",
-        "\e[95m", "\e[97m", "\e[95m", "\e[96m", "\e[92m",
+        "\e[91m", "\e[93m", "\e[94m", "\e[93m", 
+        "\e[97m", "\e[95m", "\e[96m", "\e[92m",
     };
 
     printf("\e[2;1H");
@@ -406,6 +431,12 @@ static i32 onyx_compile() {
         // check if it is the same entity. If it is, it means all other entities that were processed
         // between the two occurences didn't make any progress either, and there must be a cycle.
         //                                                              - brendanfh 2021/02/06
+        //
+        // Because of the recent changes to the compiler architecture (again), this condition
+        // does not always hold anymore. There can be nodes that get scheduled multiple times
+        // before the "key" node that will unblock the progress. This means a more sophisticated
+        // cycle detection algorithm must be used.
+        //
         static Entity* first_no_change = NULL;
         if (!changed) {
             if (!first_no_change) first_no_change = ent;
@@ -447,6 +478,16 @@ static i32 onyx_compile() {
         printf("    Processed %ld tokens (%f tokens/second).\n", lexer_tokens_processed, ((f32) 1000 * lexer_tokens_processed) / (duration));
         printf("\n");
     }
+
+    if (context.options->documentation_file != NULL) {
+        OnyxDocumentation docs = onyx_docs_generate();
+        docs.format = Doc_Format_Human;
+        onyx_docs_emit(&docs, context.options->documentation_file);
+    }
+
+#if 0
+    types_dump_type_info();
+#endif
 
     return ONYX_COMPILER_PROGRESS_SUCCESS;
 #endif

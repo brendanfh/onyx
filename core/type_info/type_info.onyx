@@ -1,0 +1,158 @@
+// A lot of these names have been copied from JAI's introspection system. This is just because
+// I don't want to mentally bike-shed about the names; I just want to get something working.
+
+package builtin.type_info
+
+type_table : [] ^Type_Info;
+
+Type_Info :: struct {
+    // This must match the order of the elements in onyxtypes.h
+    Kind :: enum {
+        Invalid           :: 0x00; // Unused
+        Basic             :: 0x01;
+        Pointer           :: 0x02;
+        Function          :: 0x03;
+        Struct            :: 0x04;
+        Compound          :: 0x05;
+        Array             :: 0x06;
+        Slice             :: 0x07;
+        Dynamic_Array     :: 0x08;
+        Variadic_Argument :: 0x09;
+        Enum              :: 0x0a;
+    }
+
+    kind := Kind.Invalid;
+    size: u32;
+
+    // Does this need to know alignment? Probably?
+    alignment: u32;
+}
+
+Type_Info_Basic :: struct {
+    use base : Type_Info;
+
+    // This must match the order of the elements in BasicKind in onyxtypes.h
+    Kind :: enum {
+        Void  :: 0x00;
+        Bool  :: 0x01;
+
+        Unsized_Int :: 0x02;
+        I8    :: 0x03;
+        U8    :: 0x04;
+        I16   :: 0x05;
+        U16   :: 0x06;
+        I32   :: 0x07;
+        U32   :: 0x08;
+        I64   :: 0x09;
+        U64   :: 0x0a;
+
+        Unsized_Float :: 0x0b;
+        F32   :: 0x0c;
+        F64   :: 0x0d;
+
+        Rawptr :: 0x0e;
+
+        I8X16 :: 0x0f;
+        I16X8 :: 0x10;
+        I32X4 :: 0x11;
+        I64X2 :: 0x12;
+        F32X4 :: 0x13;
+        F64X2 :: 0x14;
+        V128  :: 0x15;
+
+        Type_Index :: 0x16;
+    }
+
+    basic_kind: Kind;
+}
+
+Type_Info_Pointer :: struct {
+    use base : Type_Info;
+
+    @Rename
+    to: type_expr;
+}
+
+Type_Info_Function :: struct {
+    use base : Type_Info;
+
+    return_type:        type_expr;
+    parameter_types: [] type_expr;
+
+    is_variadic: bool;
+}
+
+Type_Info_Array :: struct {
+    use base : Type_Info;
+
+    @Rename
+    of: type_expr;
+    count: u32;
+}
+
+Type_Info_Slice :: struct {
+    use base : Type_Info;
+
+    @Rename
+    of: type_expr;
+}
+
+Type_Info_Dynamic_Array :: struct {
+    use base : Type_Info;
+
+    @Rename
+    of: type_expr;
+}
+
+Type_Info_Variadic_Argument :: struct {
+    use base : Type_Info;
+
+    @Rename
+    of: type_expr;
+}
+
+Type_Info_Enum :: struct {
+    use base : Type_Info;
+
+    Member :: struct {
+        name: str;
+        value: u64; // This assumes enums are always represented as ints.
+    }
+
+    // This is first for better alignment
+    backing_type: type_expr;
+    name: str;
+    members: [] Member;
+
+    is_flags: bool;
+}
+
+Type_Info_Struct :: struct {
+    use base : Type_Info;
+
+    Member :: struct {
+        name: str;
+        offset: u32;
+        type_index: type_expr;
+
+        used: bool;
+        has_default: bool;
+    }
+
+    name: str;
+    members: [] Member;
+}
+
+Type_Info_Compound :: struct {
+    use base : Type_Info;
+
+    components : [] type_expr;
+}
+
+get_type_info :: (t: type_expr) -> ^Type_Info {
+    // Grossness to get around the fact that type_exprs are not technically comparable, because in most
+    // cases you should not compare them as the number assigned to them is arbitrary.
+    if ~~t < cast(i32) 0 || ~~t >= cast(i32) type_table.count do return null;
+
+    return type_table[cast(i32) t];
+}

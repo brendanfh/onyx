@@ -470,7 +470,9 @@ void bh_buffer_grow(bh_buffer* buffer, i32 length);
 void bh_buffer_append(bh_buffer* buffer, const void * data, i32 length);
 void bh_buffer_concat(bh_buffer* buffer, bh_buffer other);
 void bh_buffer_write_byte(bh_buffer* buffer, u8 byte);
-
+void bh_buffer_write_u32(bh_buffer* buffer, u32 i);
+void bh_buffer_write_u64(bh_buffer* buffer, u64 i);
+void bh_buffer_align(bh_buffer* buffer, u32 alignment);
 
 
 
@@ -528,7 +530,7 @@ typedef struct bh__arr {
     bh__arrhead(arr)->length += n)
 
 #define bh_arr_push(arr, value)       ( \
-    bh__arr_grow(bh_arr_allocator(arr), (void **) &(arr), sizeof(*(arr)), bh_arr_length(arr) + 1), \
+    bh_arr_length(arr) + 1 > bh_arr_capacity(arr) ? bh__arr_grow(bh_arr_allocator(arr), (void **) &(arr), sizeof(*(arr)), bh_arr_length(arr) + 1) : 0, \
     arr[bh__arrhead(arr)->length++] = value)
 
 #define bh_arr_set_at(arr, n, value) ( \
@@ -1018,7 +1020,6 @@ BH_ALLOCATOR_PROC(bh_arena_allocator_proc) {
         }
 
         if (alloc_arena->size + size >= alloc_arena->arena_size) {
-            alloc_arena->size = sizeof(ptr);
             bh__arena_internal* new_arena = (bh__arena_internal *) bh_alloc(alloc_arena->backing, alloc_arena->arena_size);
 
             if (new_arena == NULL) {
@@ -1029,6 +1030,7 @@ BH_ALLOCATOR_PROC(bh_arena_allocator_proc) {
             new_arena->next_arena = NULL;
             ((bh__arena_internal *)(alloc_arena->current_arena))->next_arena = new_arena;
             alloc_arena->current_arena = new_arena;
+            alloc_arena->size = sizeof(ptr);
         }
 
         retval = bh_pointer_add(alloc_arena->current_arena, alloc_arena->size);
@@ -1953,7 +1955,26 @@ void bh_buffer_write_byte(bh_buffer* buffer, u8 byte) {
     buffer->data[buffer->length++] = byte;
 }
 
+void bh_buffer_write_u32(bh_buffer* buffer, u32 i) {
+    bh_buffer_grow(buffer, buffer->length + 4);
+    *((u32 *) bh_pointer_add(buffer->data, buffer->length)) = i;
+    buffer->length += 4;
+}
 
+void bh_buffer_write_u64(bh_buffer* buffer, u64 i) {
+    bh_buffer_grow(buffer, buffer->length + 8);
+    *((u64 *) bh_pointer_add(buffer->data, buffer->length)) = i;
+    buffer->length += 8;
+}
+
+void bh_buffer_align(bh_buffer* buffer, u32 alignment) {
+    if (buffer->length % alignment != 0) {
+        u32 difference = alignment - (buffer->length % alignment);
+        buffer->length += difference;
+
+        bh_buffer_grow(buffer, buffer->length);
+    }
+}
 
 
 #endif

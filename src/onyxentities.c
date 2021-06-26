@@ -4,7 +4,7 @@
 
 static inline i32 entity_phase(Entity* e1) {
     if (e1->state <= Entity_State_Parse) return 1;
-    if (e1->state <= Entity_State_Comptime_Check_Types) return 2;
+    if (e1->state <  Entity_State_Code_Gen) return 2;
     return 3;
 }
 
@@ -13,17 +13,17 @@ static i32 entity_compare(Entity* e1, Entity* e2) {
     i32 phase1 = entity_phase(e1);
     i32 phase2 = entity_phase(e2);
 
-    if (phase1 != phase2 || phase1 != 2) {
-        if (e1->state != e2->state)
-            return (i32) e1->state - (i32) e2->state;
-        else if (e1->type != e2->type)
-            return (i32) e1->type - (i32) e2->type;
-        else
-            return (i32) (e1->micro_attempts - e2->micro_attempts);
-
-    } else {
+    if (phase1 != phase2)
+        return phase1 - phase2;
+    else if (e1->macro_attempts != e2->macro_attempts)
         return (i32) e1->macro_attempts - (i32) e2->macro_attempts;
-    }
+    else if (e1->state != e2->state)
+        return (i32) e1->state - (i32) e2->state;
+    else if (e1->type != e2->type)
+        return (i32) e1->type - (i32) e2->type;
+    else
+        return (i32) (e1->micro_attempts - e2->micro_attempts);
+
 }
 
 #define eh_parent(index) (((index) - 1) / 2)
@@ -96,11 +96,10 @@ void entity_heap_insert_existing(EntityHeap* entities, Entity* e) {
     entities->all_count[e->state][e->type]++;
 }
 
-// nocheckin
-// Temporary wrapper
-void entity_heap_insert(EntityHeap* entities, Entity e) {
+Entity* entity_heap_insert(EntityHeap* entities, Entity e) {
     Entity* entity = entity_heap_register(entities, e);
     entity_heap_insert_existing(entities, entity);
+    return entity;
 }
 
 Entity* entity_heap_top(EntityHeap* entities) {
@@ -134,8 +133,8 @@ void entity_heap_remove_top(EntityHeap* entities) {
 
 // NOTE(Brendan Hansen): Uses the entity heap in the context structure
 void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* scope, Package* package) {
-#define ENTITY_INSERT(_ent) {                                   \
-    Entity* entity = entity_heap_register(entities, _ent);       \
+#define ENTITY_INSERT(_ent)                                     \
+    entity = entity_heap_register(entities, _ent);              \
     if (target_arr) {                                           \
         bh_arr(Entity *) __tmp_arr = *target_arr;               \
         bh_arr_push(__tmp_arr, entity);                         \
@@ -143,9 +142,10 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
     } else {                                                    \
         entity_heap_insert_existing(entities, entity);          \
     }                                                           \
-    }
+    
 
     EntityHeap* entities = &context.entities;
+    Entity* entity;
     
     Entity ent;
     ent.state = Entity_State_Resolve_Symbols;
@@ -187,10 +187,12 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
                 ent.type     = Entity_Type_Function_Header;
                 ent.function = (AstFunction *) node;
                 ENTITY_INSERT(ent);
+                ((AstFunction *) node)->entity_header = entity;
                 
                 ent.type     = Entity_Type_Function;
                 ent.function = (AstFunction *) node;
                 ENTITY_INSERT(ent);
+                ((AstFunction *) node)->entity_body = entity;
             }
             break;
         }
@@ -238,6 +240,7 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
             ent.type = Entity_Type_Struct_Member_Default;
             ent.type_alias = (AstType *) node;
             ENTITY_INSERT(ent);
+            ((AstStructType *) node)->entity_defaults = entity;
             // fallthrough
         }
         
@@ -246,6 +249,11 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
             ent.type = Entity_Type_Type_Alias;
             ent.type_alias = (AstType *) node;
             ENTITY_INSERT(ent);
+
+            if (node->kind == Ast_Kind_Struct_Type) {
+                ((AstStructType *) node)->entity_type = entity;
+            }
+
             break;
         }
         
@@ -258,7 +266,7 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
         
         case Ast_Kind_Use: {
             if (((AstUse *) node)->expr->kind == Ast_Kind_Package) {
-                ent.state = Entity_State_Comptime_Resolve_Symbols;
+                ent.state = Entity_State_Resolve_Symbols;
                 ent.type = Entity_Type_Use_Package;
             } else {
                 ent.type = Entity_Type_Use;
@@ -288,9 +296,9 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
         }
 
         case Ast_Kind_Static_If: {
-            ent.state = Entity_State_Comptime_Resolve_Symbols;
+            ent.state = Entity_State_Resolve_Symbols;
             ent.type = Entity_Type_Static_If;
-            ent.static_if = (AstStaticIf *) node;
+            ent.static_if = (AstIf *) node;
             ENTITY_INSERT(ent);
             break;
         }
@@ -311,6 +319,14 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
             ENTITY_INSERT(ent);
             break;
         }
+
+        case Ast_Kind_Note: {
+            ent.type = Entity_Type_Note;
+            ent.expr = (AstTyped *) node;
+            ent.state = Entity_State_Code_Gen;
+            ENTITY_INSERT(ent);
+            break;
+        }
         
         default: {
             ent.type = Entity_Type_Expression;
@@ -319,4 +335,6 @@ void add_entities_for_node(bh_arr(Entity *) *target_arr, AstNode* node, Scope* s
             break;
         }
     }
+    
+    node->entity = entity;
 }

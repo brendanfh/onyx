@@ -17,7 +17,7 @@
 
 static AstNode error_node = { Ast_Kind_Error, 0, NULL, NULL };
 
-#define ENTITY_SUBMIT(node)                 (submit_entity_in_scope(parser, (AstNode *) (node), bh_arr_last(parser->scope_stack), parser->package))
+#define ENTITY_SUBMIT(node)                 (submit_entity_in_scope(parser, (AstNode *) (node), parser->current_scope, parser->package))
 #define ENTITY_SUBMIT_IN_SCOPE(node, scope) (submit_entity_in_scope(parser, (AstNode *) (node), scope, parser->package))
 
 void submit_entity_in_scope(OnyxParser* parser, AstNode* node, Scope* scope, Package* package) {
@@ -54,7 +54,7 @@ static AstSwitch*     parse_switch_stmt(OnyxParser* parser);
 static i32            parse_possible_symbol_declaration(OnyxParser* parser, AstNode** ret);
 static AstReturn*     parse_return_stmt(OnyxParser* parser);
 static AstNode*       parse_use_stmt(OnyxParser* parser);
-static AstBlock*      parse_block(OnyxParser* parser);
+static AstBlock*      parse_block(OnyxParser* parser, b32 make_a_new_scope);
 static AstNode*       parse_statement(OnyxParser* parser);
 static AstType*       parse_type(OnyxParser* parser);
 static AstStructType* parse_struct(OnyxParser* parser);
@@ -64,7 +64,7 @@ static b32            parse_possible_function_definition(OnyxParser* parser, Ast
 static AstFunction*   parse_function_definition(OnyxParser* parser, OnyxToken* token);
 static AstTyped*      parse_global_declaration(OnyxParser* parser);
 static AstEnumType*   parse_enum_declaration(OnyxParser* parser);
-static AstStaticIf*   parse_static_if_stmt(OnyxParser* parser);
+static AstIf*         parse_static_if_stmt(OnyxParser* parser, b32 parse_block_as_statements);
 static AstTyped*      parse_top_level_expression(OnyxParser* parser);
 static AstBinding*    parse_top_level_binding(OnyxParser* parser, OnyxToken* symbol);
 static void           parse_top_level_statement(OnyxParser* parser);
@@ -76,8 +76,15 @@ static void consume_token(OnyxParser* parser) {
     parser->prev = parser->curr;
     // :LinearTokenDependent
     parser->curr++;
-    while (parser->curr->type == Token_Type_Comment || parser->curr->type == Token_Type_Note)
+    while (parser->curr->type == Token_Type_Comment || parser->curr->type == Token_Type_Note) {
+        if (parser->curr->type == Token_Type_Note) {
+            AstNote* note = make_node(AstNode, Ast_Kind_Note);
+            note->token = parser->curr;
+            ENTITY_SUBMIT(note);
+        }
+
         parser->curr++;
+    }
 }
 
 static OnyxToken* find_matching_paren(OnyxToken* paren) {
@@ -252,6 +259,8 @@ static b32 parse_possible_array_literal(OnyxParser* parser, AstTyped* left, AstT
     expect_token(parser, '.');
     expect_token(parser, '[');
     while (!consume_token_if_next(parser, ']')) {
+        if (parser->hit_unexpected_token) return 1;
+        
         AstTyped* value = parse_expression(parser, 0);
         bh_arr_push(al->values, value);
 
@@ -462,6 +471,7 @@ static AstTyped* parse_factor(OnyxParser* parser) {
 
         case Token_Type_Keyword_Proc: {
             OnyxToken* proc_token = expect_token(parser, Token_Type_Keyword_Proc);
+            onyx_report_warning(proc_token->pos, "Warning: 'proc' is a deprecated keyword.");
             retval = (AstTyped *) parse_function_definition(parser, proc_token);
             break;
         }
@@ -600,14 +610,13 @@ static AstTyped* parse_factor(OnyxParser* parser) {
                 OnyxToken *open_bracket = expect_token(parser, '[');
                 AstTyped *expr = parse_compound_expression(parser, 0);
 
-                AstKind kind = Ast_Kind_Array_Access;
+                AstSubscript *sub_node = make_node(AstSubscript, Ast_Kind_Subscript);
+                sub_node->token = open_bracket;
+                sub_node->addr = retval;
+                sub_node->expr = expr;
+                sub_node->__unused_operation = Binary_Op_Subscript;
 
-                AstArrayAccess *aa_node = make_node(AstArrayAccess, kind);
-                aa_node->token = open_bracket;
-                aa_node->addr = retval;
-                aa_node->expr = expr;
-
-                retval = (AstTyped *) aa_node;
+                retval = (AstTyped *) sub_node;
                 expect_token(parser, ']');
                 break;
             }
@@ -635,11 +644,15 @@ static AstTyped* parse_factor(OnyxParser* parser) {
                 parse_arguments(parser, ')', &call_node->args);
 
                 // Wrap expressions in AstArgument
-                bh_arr_each(AstTyped *, arg, call_node->args.values)
+                bh_arr_each(AstTyped *, arg, call_node->args.values) {
+                    if ((*arg) == NULL) continue;
                     *arg = (AstTyped *) make_argument(parser->allocator, *arg);
+                }
 
-                bh_arr_each(AstNamedValue *, named_value, call_node->args.named_values)
+                bh_arr_each(AstNamedValue *, named_value, call_node->args.named_values) {
+                    if ((*named_value)->value == NULL) continue;
                     (*named_value)->value = (AstTyped *) make_argument(parser->allocator, (AstTyped *) (*named_value)->value);
+                }
 
                 retval = (AstTyped *) call_node;
                 break;
@@ -752,6 +765,7 @@ static BinaryOp binary_op_from_token_type(TokenType t) {
 
         case Token_Type_Pipe:              return Binary_Op_Pipe;
         case Token_Type_Dot_Dot:           return Binary_Op_Range;
+        case '[':                          return Binary_Op_Subscript;
         default: return Binary_Op_Count;
     }
 }
@@ -814,6 +828,7 @@ static AstTyped* parse_expression(OnyxParser* parser, b32 assignment_allowed) {
         bin_op_kind = binary_op_from_token_type(parser->curr->type);
         if (bin_op_kind == Binary_Op_Count) goto expression_done;
         if (binop_is_assignment(bin_op_kind) && !assignment_allowed) goto expression_done;
+        if (bin_op_kind == Binary_Op_Subscript) goto expression_done;
 
         bin_op_tok = parser->curr;
         consume_token(parser);
@@ -880,7 +895,7 @@ static AstIfWhile* parse_if_stmt(OnyxParser* parser) {
     // an error is reported in the typechecking, saying that assignment isn't allowed
     // here, which is better than an unexpected token error.
     AstTyped* cond = parse_expression(parser, 1);
-    AstBlock* true_stmt = parse_block(parser);
+    AstBlock* true_stmt = parse_block(parser, 1);
 
     if_node->cond = cond;
     if (true_stmt != NULL)
@@ -893,7 +908,7 @@ static AstIfWhile* parse_if_stmt(OnyxParser* parser) {
         elseif_node->token = parser->curr - 1;
 
         cond = parse_expression(parser, 1);
-        true_stmt = parse_block(parser);
+        true_stmt = parse_block(parser, 1);
 
         elseif_node->cond = cond;
         if (true_stmt != NULL)
@@ -904,7 +919,7 @@ static AstIfWhile* parse_if_stmt(OnyxParser* parser) {
     }
 
     if (consume_token_if_next(parser, Token_Type_Keyword_Else)) {
-        AstBlock* false_stmt = parse_block(parser);
+        AstBlock* false_stmt = parse_block(parser, 1);
         if (false_stmt != NULL)
             if_node->false_stmt = false_stmt;
     }
@@ -935,10 +950,10 @@ static AstIfWhile* parse_while_stmt(OnyxParser* parser) {
     }
 
     while_node->cond = parse_expression(parser, 1);
-    while_node->true_stmt = parse_block(parser);
+    while_node->true_stmt = parse_block(parser, 1);
 
     if (consume_token_if_next(parser, Token_Type_Keyword_Else)) {
-        while_node->false_stmt = parse_block(parser);
+        while_node->false_stmt = parse_block(parser, 1);
     }
 
     return while_node;
@@ -959,7 +974,7 @@ static AstFor* parse_for_stmt(OnyxParser* parser) {
 
     expect_token(parser, ':');
     for_node->iter = parse_expression(parser, 1);
-    for_node->stmt = parse_block(parser);
+    for_node->stmt = parse_block(parser, 1);
 
     return for_node;
 }
@@ -997,7 +1012,7 @@ static AstSwitch* parse_switch_stmt(OnyxParser* parser) {
         bh_arr_new(global_heap_allocator, case_values, 1);
 
         if (parse_possible_directive(parser, "default")) {
-            switch_node->default_case = parse_block(parser);
+            switch_node->default_case = parse_block(parser, 1);
 
             if (parser->curr->type != '}') {
                 onyx_report_error(parser->curr->pos, "The #default case must be the last case in a switch statement.\n");
@@ -1014,7 +1029,7 @@ static AstSwitch* parse_switch_stmt(OnyxParser* parser) {
             bh_arr_push(case_values, value);
         }
 
-        AstBlock* block = parse_block(parser);
+        AstBlock* block = parse_block(parser, 1);
 
         AstSwitchCase sc_node;
         sc_node.block  = block;
@@ -1220,7 +1235,7 @@ static AstNode* parse_statement(OnyxParser* parser) {
         case Token_Type_Empty_Block:
         case Token_Type_Keyword_Do:
             needs_semicolon = 0;
-            retval = (AstNode *) parse_block(parser);
+            retval = (AstNode *) parse_block(parser, 1);
             break;
 
         case Token_Type_Symbol: {
@@ -1303,7 +1318,7 @@ static AstNode* parse_statement(OnyxParser* parser) {
                 assignment2->left = builtin_context_variable;
                 assignment2->right = (AstTyped *) context_tmp;
 
-                AstBlock* context_block = parse_block(parser);
+                AstBlock* context_block = parse_block(parser, 1);
                 assignment->next = (AstNode *) context_block;
 
                 AstDefer* defer_node = make_node(AstDefer, Ast_Kind_Defer);
@@ -1320,16 +1335,16 @@ static AstNode* parse_statement(OnyxParser* parser) {
             This is in theory where the static if in procedures will be parsed. However,
             this breaks many things because static if statements currently only parse top
             level expressions in them, not general statements.
+            */
 
             if (next_tokens_are(parser, 2, '#', Token_Type_Keyword_If)) {
-                AstStaticIf* static_if = parse_static_if_stmt(parser);
+                AstIf* static_if = parse_static_if_stmt(parser, 1);
                 ENTITY_SUBMIT(static_if);
 
                 needs_semicolon = 0;
                 retval = (AstNode *) static_if;
                 break;
             }
-            */
         }
 
         default:
@@ -1341,7 +1356,7 @@ static AstNode* parse_statement(OnyxParser* parser) {
     return retval;
 }
 
-static AstBlock* parse_block(OnyxParser* parser) {
+static AstBlock* parse_block(OnyxParser* parser, b32 make_a_new_scope) {
     AstBlock* block = make_node(AstBlock, Ast_Kind_Block);
 
     // NOTE: --- is for an empty block
@@ -1350,14 +1365,15 @@ static AstBlock* parse_block(OnyxParser* parser) {
         return block;
     }
 
-    Scope* parent_scope = bh_arr_last(parser->scope_stack);
-    block->binding_scope = scope_create(parser->allocator, parent_scope, parser->curr->pos);
-    bh_arr_push(parser->scope_stack, block->binding_scope);
+    if (make_a_new_scope) {
+        block->binding_scope = scope_create(parser->allocator, parser->current_scope, parser->curr->pos);
+        parser->current_scope = block->binding_scope;
+    }
 
     if (parser->curr->type == Token_Type_Keyword_Do) {
         block->token = expect_token(parser, Token_Type_Keyword_Do);
         block->body = parse_statement(parser);
-        bh_arr_pop(parser->scope_stack);
+        if (make_a_new_scope) parser->current_scope = parser->current_scope->parent;
         return block;
     }
 
@@ -1367,7 +1383,7 @@ static AstBlock* parse_block(OnyxParser* parser) {
     AstNode* stmt = NULL;
     while (!consume_token_if_next(parser, '}')) {
         if (parser->hit_unexpected_token) {
-            bh_arr_pop(parser->scope_stack);
+            if (make_a_new_scope) parser->current_scope = parser->current_scope->parent;
             return block;
         }
 
@@ -1381,7 +1397,7 @@ static AstBlock* parse_block(OnyxParser* parser) {
         }
     }
 
-    bh_arr_pop(parser->scope_stack);
+    if (make_a_new_scope) parser->current_scope = parser->current_scope->parent;
     return block;
 }
 
@@ -1416,6 +1432,14 @@ static void parse_polymorphic_variable(OnyxParser* parser, AstType*** next_inser
 }
 
 static AstType* parse_compound_type(OnyxParser* parser) {
+    // CLEANUP this is little weird having this here because it means that this parses:
+    //
+    //      foo :: (x: (something_here: i32)) -> void ---
+    //
+    if (next_tokens_are(parser, 2, Token_Type_Symbol, ':')) {
+        consume_tokens(parser, 2);
+    }
+
     AstType* first = parse_type(parser);
 
     if (parser->curr->type == ',') {
@@ -1427,6 +1451,11 @@ static AstType* parse_compound_type(OnyxParser* parser) {
 
         while (consume_token_if_next(parser, ',')) {
             if (parser->hit_unexpected_token) return (AstType *) ctype;
+
+            if (next_tokens_are(parser, 2, Token_Type_Symbol, ':')) {
+                consume_tokens(parser, 2);
+            }
+
             bh_arr_push(ctype->types, parse_type(parser));
         }
 
@@ -1525,6 +1554,7 @@ static AstType* parse_type(OnyxParser* parser) {
 
             case Token_Type_Keyword_Proc: {
                 OnyxToken* proc_token = expect_token(parser, Token_Type_Keyword_Proc);
+                onyx_report_warning(proc_token->pos, "Warning: 'proc' is a deprecated keyword.");
                 *next_insertion = parse_function_type(parser, proc_token);
                 next_insertion = NULL;
                 break;
@@ -1710,8 +1740,8 @@ static AstStructType* parse_struct(OnyxParser* parser) {
 
         if (next_tokens_are(parser, 3, Token_Type_Symbol, ':', ':')) {
             if (!s_node->scope) {
-                s_node->scope = scope_create(context.ast_alloc, bh_arr_last(parser->scope_stack), s_node->token->pos);
-                bh_arr_push(parser->scope_stack, s_node->scope);
+                s_node->scope = scope_create(context.ast_alloc, parser->current_scope, s_node->token->pos);
+                parser->current_scope = s_node->scope;
             }
 
             OnyxToken* binding_name = expect_token(parser, Token_Type_Symbol);
@@ -1770,7 +1800,7 @@ static AstStructType* parse_struct(OnyxParser* parser) {
         }
     }
 
-    if (s_node->scope) bh_arr_pop(parser->scope_stack);
+    if (s_node->scope) parser->current_scope = parser->current_scope->parent;
 
     bh_arr_free(member_list_temp);
 
@@ -1841,8 +1871,19 @@ static void parse_function_params(OnyxParser* parser, AstFunction* func) {
             }
         }
 
-        if (curr_param.vararg_kind == VA_Kind_Not_VA && consume_token_if_next(parser, '='))
-            curr_param.default_value = parse_expression(parser, 0);
+        if (curr_param.vararg_kind == VA_Kind_Not_VA && consume_token_if_next(parser, '=')) {
+            OnyxToken* directive_token = parser->curr;
+
+            // :Callsite  currently #callsite is only valid as a default value for a funciton parameter.
+            if (parse_possible_directive(parser, "callsite")) {
+                AstCallSite* cs = make_node(AstCallSite, Ast_Kind_Call_Site);
+                cs->token = directive_token;
+                curr_param.default_value = (AstTyped *) cs;
+
+            } else {
+                curr_param.default_value = parse_expression(parser, 0);
+            }
+        }
 
         if (param_is_baked) {
             param_is_baked = 0;
@@ -1868,27 +1909,41 @@ static void parse_function_params(OnyxParser* parser, AstFunction* func) {
     return;
 }
 
-static AstFunction* parse_function_definition(OnyxParser* parser, OnyxToken* token) {
-    if (consume_token_if_next(parser, '{')) {
-        AstOverloadedFunction* ofunc = make_node(AstOverloadedFunction, Ast_Kind_Overloaded_Function);
-        ofunc->token = token;
-        ofunc->flags |= Ast_Flag_Comptime;
+static AstOverloadedFunction* parse_overloaded_function(OnyxParser* parser, OnyxToken* token) {
+    expect_token(parser, '{');
 
-        bh_arr_new(global_heap_allocator, ofunc->overloads, 4);
+    AstOverloadedFunction* ofunc = make_node(AstOverloadedFunction, Ast_Kind_Overloaded_Function);
+    ofunc->token = token;
+    ofunc->flags |= Ast_Flag_Comptime;
 
-        while (!consume_token_if_next(parser, '}')) {
-            if (parser->hit_unexpected_token) return (AstFunction *) ofunc;
+    bh_arr_new(global_heap_allocator, ofunc->overloads, 4);
 
-            AstTyped* o_node = parse_expression(parser, 0);
+    u64 precedence = 0;
+    while (!consume_token_if_next(parser, '}')) {
+        if (parser->hit_unexpected_token) return ofunc;
 
-            bh_arr_push(ofunc->overloads, o_node);
+        if (parse_possible_directive(parser, "precedence")) {
+            AstNumLit* pre = parse_int_literal(parser);
+            if (parser->hit_unexpected_token) return ofunc;
 
-            if (parser->curr->type != '}')
-                expect_token(parser, ',');
+            precedence = bh_max(pre->value.l, 0);
         }
-        
-        ENTITY_SUBMIT(ofunc);
-        return (AstFunction *) ofunc;
+
+        AstTyped* option = parse_expression(parser, 0);
+        add_overload_option(&ofunc->overloads, precedence++, option);
+
+        if (parser->curr->type != '}')
+            expect_token(parser, ',');
+    }
+    
+    ENTITY_SUBMIT(ofunc);
+    return ofunc;
+}
+
+static AstFunction* parse_function_definition(OnyxParser* parser, OnyxToken* token) {
+    // :TemporaryForProcRemoval
+    if (parser->curr->type == '{') {
+        return (AstFunction *) parse_overloaded_function(parser, token);
     }
 
     AstFunction* func_def = make_node(AstFunction, Ast_Kind_Function);
@@ -1936,7 +1991,7 @@ static AstFunction* parse_function_definition(OnyxParser* parser, OnyxToken* tok
         }
     }
 
-    func_def->body = parse_block(parser);
+    func_def->body = parse_block(parser, 1);
 
     if (bh_arr_length(polymorphic_vars) > 0) {
         AstPolyProc* pp = make_node(AstPolyProc, Ast_Kind_Polymorphic_Proc);
@@ -1957,6 +2012,7 @@ static AstFunction* parse_function_definition(OnyxParser* parser, OnyxToken* tok
 static b32 parse_possible_function_definition(OnyxParser* parser, AstTyped** ret) {
     if (parser->curr->type == Token_Type_Keyword_Proc) {
         OnyxToken* proc_token = expect_token(parser, Token_Type_Keyword_Proc);
+        onyx_report_warning(proc_token->pos, "Warning: 'proc' is a deprecated keyword.");
         AstFunction* func_node = parse_function_definition(parser, proc_token);
         *ret = (AstTyped *) func_node;
         return 1;
@@ -2072,8 +2128,8 @@ static AstEnumType* parse_enum_declaration(OnyxParser* parser) {
     return enum_node;
 }
 
-static AstStaticIf* parse_static_if_stmt(OnyxParser* parser) {
-    AstStaticIf* static_if_node = make_node(AstStaticIf, Ast_Kind_Static_If);
+static AstIf* parse_static_if_stmt(OnyxParser* parser, b32 parse_block_as_statements) {
+    AstIf* static_if_node = make_node(AstIf, Ast_Kind_Static_If);
     static_if_node->token = expect_token(parser, '#');
     expect_token(parser, Token_Type_Keyword_If);
 
@@ -2082,11 +2138,16 @@ static AstStaticIf* parse_static_if_stmt(OnyxParser* parser) {
     bh_arr_new(global_heap_allocator, static_if_node->true_entities, 2);
     bh_arr_push(parser->alternate_entity_placement_stack, &static_if_node->true_entities);
 
-    expect_token(parser, '{');
-    while (!consume_token_if_next(parser, '}')) {
-        if (parser->hit_unexpected_token) return static_if_node;
+    if (parse_block_as_statements) {
+        static_if_node->true_stmt = parse_block(parser, 0);
 
-        parse_top_level_statement(parser);
+    } else {
+        expect_token(parser, '{');
+        while (!consume_token_if_next(parser, '}')) {
+            if (parser->hit_unexpected_token) return static_if_node;
+
+            parse_top_level_statement(parser);
+        }
     }
 
     bh_arr_pop(parser->alternate_entity_placement_stack);
@@ -2095,11 +2156,16 @@ static AstStaticIf* parse_static_if_stmt(OnyxParser* parser) {
         bh_arr_new(global_heap_allocator, static_if_node->false_entities, 2);
         bh_arr_push(parser->alternate_entity_placement_stack, &static_if_node->false_entities);
 
-        expect_token(parser, '{');
-        while (!consume_token_if_next(parser, '}')) {
-            if (parser->hit_unexpected_token) return static_if_node;
+        if (parse_block_as_statements) {
+            static_if_node->false_stmt = parse_block(parser, 0);
 
-            parse_top_level_statement(parser);
+        } else {
+            expect_token(parser, '{');
+            while (!consume_token_if_next(parser, '}')) {
+                if (parser->hit_unexpected_token) return static_if_node;
+
+                parse_top_level_statement(parser);
+            }
         }
 
         bh_arr_pop(parser->alternate_entity_placement_stack);
@@ -2111,6 +2177,7 @@ static AstStaticIf* parse_static_if_stmt(OnyxParser* parser) {
 static AstTyped* parse_top_level_expression(OnyxParser* parser) {
     if (parser->curr->type == Token_Type_Keyword_Proc) {
         OnyxToken* proc_token = expect_token(parser, Token_Type_Keyword_Proc);
+        onyx_report_warning(proc_token->pos, "Warning: 'proc' is a deprecated keyword.");
         AstFunction* func_node = parse_function_definition(parser, proc_token);
 
         return (AstTyped *) func_node;
@@ -2124,6 +2191,13 @@ static AstTyped* parse_top_level_expression(OnyxParser* parser) {
         AstTypeAlias* alias = make_node(AstTypeAlias, Ast_Kind_Type_Alias);
         alias->to = parse_type(parser);
         return (AstTyped *) alias;
+    }
+
+    if (parse_possible_directive(parser, "match")) {
+        // :LinearTokenDependent
+        OnyxToken* directive_token = parser->curr - 2;
+        AstOverloadedFunction* ofunc = parse_overloaded_function(parser, directive_token);
+        return (AstTyped *) ofunc;
     }
     
     return parse_expression(parser, 1);
@@ -2197,9 +2271,10 @@ static void parse_top_level_statement(OnyxParser* parser) {
             return;
         }
 
-        case Token_Type_Keyword_Proc:
-            parse_top_level_expression(parser);
-            return;
+        // case Token_Type_Keyword_Proc:
+        //     onyx_report_warning(parser->curr->pos, "Warning: 'proc' is a deprecated keyword.");
+        //     parse_top_level_expression(parser);
+        //     return;
 
         case Token_Type_Symbol: {
             OnyxToken* symbol = expect_token(parser, Token_Type_Symbol);
@@ -2207,7 +2282,7 @@ static void parse_top_level_statement(OnyxParser* parser) {
 
             if (parser->curr->type == ':') {
                 binding = parse_top_level_binding(parser, symbol);
-                if (binding != NULL) binding->node->flags |= private_kind;
+                if (binding != NULL) binding->flags |= private_kind;
 
                 goto submit_binding_to_entities;
             }
@@ -2221,12 +2296,12 @@ static void parse_top_level_statement(OnyxParser* parser) {
             if (consume_token_if_next(parser, '='))
                 memres->initial_value = parse_expression(parser, 1);
             
-            memres->flags |= private_kind;
             
             ENTITY_SUBMIT(memres);
             
             binding = make_node(AstBinding, Ast_Kind_Binding);
             binding->token = symbol;
+            binding->flags |= private_kind;
             binding->node = (AstNode *) memres;
 
             goto submit_binding_to_entities;
@@ -2234,7 +2309,7 @@ static void parse_top_level_statement(OnyxParser* parser) {
 
         case '#': {
             if (next_tokens_are(parser, 2, '#', Token_Type_Keyword_If)) {
-                AstStaticIf* static_if = parse_static_if_stmt(parser);
+                AstIf* static_if = parse_static_if_stmt(parser, 0);
                 ENTITY_SUBMIT(static_if);
                 return;
             }
@@ -2283,6 +2358,7 @@ static void parse_top_level_statement(OnyxParser* parser) {
 
                 BinaryOp op = binary_op_from_token_type(parser->curr->type);
                 consume_token(parser);
+                if (op == Binary_Op_Subscript) expect_token(parser, ']');    // #operator [] ... needs to consume the other ']'
                 
                 if (op == Binary_Op_Count) {
                     onyx_report_error(parser->curr->pos, "Invalid binary operator.");
@@ -2295,12 +2371,22 @@ static void parse_top_level_statement(OnyxParser* parser) {
                 ENTITY_SUBMIT(operator);
                 return;
             }
-            else if (parse_possible_directive(parser, "add_overload")) {
+            else if (parse_possible_directive(parser, "add_overload") || parse_possible_directive(parser, "add_match")) {
                 AstDirectiveAddOverload *add_overload = make_node(AstDirectiveAddOverload, Ast_Kind_Directive_Add_Overload);
                 add_overload->token = dir_token;
                 add_overload->overloaded_function = (AstNode *) parse_expression(parser, 0);
 
                 expect_token(parser, ',');
+
+                if (parse_possible_directive(parser, "precedence")) {
+                    AstNumLit* pre = parse_int_literal(parser);
+                    if (parser->hit_unexpected_token) return;
+
+                    add_overload->precedence = bh_max(pre->value.l, 0);
+                } else {
+                    add_overload->precedence = 0;
+                }
+
                 add_overload->overload = parse_expression(parser, 0);
 
                 ENTITY_SUBMIT(add_overload);
@@ -2337,9 +2423,9 @@ submit_binding_to_entities:
 
         Scope* target_scope = parser->package->scope;
 
-        if (binding->node->flags & Ast_Flag_Private_Package)
+        if (binding->flags & Ast_Flag_Private_Package)
             target_scope = parser->package->private_scope;
-        if (binding->node->flags & Ast_Flag_Private_File)
+        if (binding->flags & Ast_Flag_Private_File)
             target_scope = parser->file_scope;
         
         ENTITY_SUBMIT_IN_SCOPE(binding, target_scope);
@@ -2445,7 +2531,7 @@ OnyxParser onyx_parser_create(bh_allocator alloc, OnyxTokenizer *tokenizer) {
     parser.curr = tokenizer->tokens;
     parser.prev = NULL;
     parser.hit_unexpected_token = 0;
-    parser.scope_stack = NULL;
+    parser.current_scope = NULL;
     parser.alternate_entity_placement_stack = NULL;
 
     parser.polymorph_context = (PolymorphicContext) {
@@ -2453,23 +2539,21 @@ OnyxParser onyx_parser_create(bh_allocator alloc, OnyxTokenizer *tokenizer) {
         .poly_params = NULL,
     };
 
-    bh_arr_new(global_heap_allocator, parser.scope_stack, 4);
     bh_arr_new(global_heap_allocator, parser.alternate_entity_placement_stack, 4);
 
     return parser;
 }
 
 void onyx_parser_free(OnyxParser* parser) {
-    bh_arr_free(parser->scope_stack);
 }
 
 void onyx_parse(OnyxParser *parser) {
     // NOTE: Skip comments at the beginning of the file
-    while (consume_token_if_next(parser, Token_Type_Comment));
+    while (consume_token_if_next(parser, Token_Type_Comment) || consume_token_if_next(parser, Token_Type_Note));
 
     parser->package = parse_file_package(parser);
     parser->file_scope = scope_create(parser->allocator, parser->package->private_scope, parser->tokenizer->tokens[0].pos);
-    bh_arr_push(parser->scope_stack, parser->file_scope);
+    parser->current_scope = parser->file_scope;
 
     AstUse* implicit_use_builtin = make_node(AstUse, Ast_Kind_Use);
     AstPackage* implicit_builtin_package = make_node(AstPackage, Ast_Kind_Package);
@@ -2483,5 +2567,5 @@ void onyx_parse(OnyxParser *parser) {
         parse_top_level_statement(parser);
     }
 
-    bh_arr_pop(parser->scope_stack);
+    parser->current_scope = parser->current_scope->parent;
 }

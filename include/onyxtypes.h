@@ -31,6 +31,10 @@ enum BasicKind {
     Basic_Kind_F32X4,
     Basic_Kind_F64X2,
     Basic_Kind_V128,
+
+    Basic_Kind_Type_Index,
+
+    Basic_Kind_Count,
 };
 
 enum BasicFlag {
@@ -42,8 +46,11 @@ enum BasicFlag {
 
     Basic_Flag_SIMD             = BH_BIT(5),
 
+    Basic_Flag_Type_Index       = BH_BIT(6),
+
     Basic_Flag_Numeric          = Basic_Flag_Integer | Basic_Flag_Float,
     Basic_Flag_Ordered          = Basic_Flag_Integer | Basic_Flag_Float | Basic_Flag_Pointer,
+    Basic_Flag_Equality         = Basic_Flag_Ordered | Basic_Flag_Type_Index,
     Basic_Flag_Constant_Type    = Basic_Flag_Boolean | Basic_Flag_Numeric | Basic_Flag_Pointer,
     Basic_Flag_Numeric_Ordered  = Basic_Flag_Numeric | Basic_Flag_Ordered,
 };
@@ -84,12 +91,12 @@ struct TypeWithOffset {
     TYPE_KIND(Pointer, struct { TypeBasic base; Type *elem; })    \
     TYPE_KIND(Function, struct {                                  \
         Type *return_type;                                        \
-        u32 param_count;                                          \
-        u32 needed_param_count;                                   \
+        u16 param_count;                                          \
+        u16 needed_param_count;                                   \
+        i16 vararg_arg_pos;                                       \
         Type* params[];                                           \
     })                                                            \
     TYPE_KIND(Struct, struct {                                    \
-        u64 unique_id;                                            \
         char* name;                                               \
         u32 size;                                                 \
         u16 alignment, mem_count;                                 \
@@ -110,9 +117,9 @@ struct TypeWithOffset {
     TYPE_KIND(DynArray, struct { Type *ptr_to_data; })            \
     TYPE_KIND(VarArgs, struct { Type *ptr_to_data; })             \
     TYPE_KIND(Enum, struct {                                      \
-        u64 unique_id;                                            \
         char* name;                                               \
         Type* backing;                                            \
+        b32   is_flags;                                           \
     })
 
 
@@ -137,8 +144,9 @@ enum TypeFlag {
 struct Type {
     TypeKind kind;
 
+    u32 id;
     u32 flags;
-    
+
     // NOTE(Brendan Hansen): The abstract syntax tree node used to create
     // the type. Primarily used to look up symbols in scopes that are embedded
     // in the type.
@@ -151,16 +159,20 @@ struct Type {
     };
 };
 
+extern bh_imap type_map;
+
 extern Type basic_types[];
 
 struct AstType;
 struct AstFunction;
 struct AstCompound;
 
+void types_init();
+void types_dump_type_info();
+
 b32 types_are_compatible(Type* t1, Type* t2);
 u32 type_size_of(Type* type);
 u32 type_alignment_of(Type* type);
-u32 type_aligned_size_of(Type* type);
 Type* type_build_from_ast(bh_allocator alloc, struct AstType* type_node);
 
 Type* type_build_function_type(bh_allocator alloc, struct AstFunction* func);
@@ -183,6 +195,7 @@ b32 type_lookup_member_by_idx(Type* type, i32 idx, StructMember* smem);
 
 i32 type_linear_member_count(Type* type);
 b32 type_linear_member_lookup(Type* type, i32 idx, TypeWithOffset* two);
+i32 type_get_idx_of_linear_member_with_offset(Type* type, u32 offset);
 
 b32 type_struct_is_simple(Type* type);
 

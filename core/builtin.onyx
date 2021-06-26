@@ -22,7 +22,7 @@ vararg :: #type ^struct {
     count: i32;
 }
 
-vararg_get :: proc {
+vararg_get :: #match {
     (va: vararg, ret: ^$T) -> bool {
         if va.count <= 0 do return false;
         *ret = *cast(^T) va.data;
@@ -41,7 +41,7 @@ vararg_get :: proc {
 }
 
 @NullProcHack
-null_proc :: proc () #null ---
+null_proc :: () -> void #null ---
 null      :: cast(rawptr) 0;
 
 // I find myself wanting to return a completely nullified string like the
@@ -55,7 +55,7 @@ OnyxContext :: struct {
 
     logger         : Logger = .{ default_logger, null };
 
-    assert_handler : (msg: str, file: str) -> void;
+    assert_handler : (msg: str, site: CallSite) -> void;
 }
 
 #if runtime.Runtime != runtime.Runtime_Custom {
@@ -79,8 +79,8 @@ OnyxContext :: struct {
 // first parameter to ALL procedures in a compilation unit.
 context : OnyxContext;
 
-assert :: (cond: bool, msg: str, file: str = null_str) {
-    if !cond do context.assert_handler(msg, file);
+assert :: (cond: bool, msg: str, site := #callsite) {
+    if !cond do context.assert_handler(msg, site);
 }
 
 
@@ -145,10 +145,20 @@ cfree   :: (ptr: rawptr) do raw_free(context.allocator, ptr);
         // @Robustness: This should be a '#if' when those are added in procedures because
         // otherwise the __initialize intrinsic is going to be generated no matter what.
         // This could be a problem if the type is not something that can be initialized.
+        //
+        // Static ifs in procedures are added now, however, much like nested procedures,
+        // static ifs cannot "see" polymorphic variables. They are only evaluated once
+        // NOT in the context of the polymorphic procedure they are instatiated in.
+        // This will be changed eventually. 'make' can be used for the time being or
+        // for forever.
         use package core.intrinsics.onyx { __initialize }
         if initialize do __initialize(res);
         
         return res;
+    }
+
+    make :: ($T: type_expr, allocator := context.allocator) -> ^T {
+        return cast(^T) raw_alloc(allocator, sizeof T);
     }
 }
 
@@ -157,4 +167,16 @@ Iterator :: struct (T: type_expr) {
     data:  rawptr;
     next:  (data: rawptr) -> (T, bool);
     close: (data: rawptr) -> void = null_proc;
+}
+
+
+
+// This structure represents the result of a '#callsite' expression. Currently,
+// #callsite is only valid (and parsed) as a default value for a procedure parameter.
+// It allows the function to get the address of the calling site, which can be
+// used for error printing, unique hashes, and much more.
+CallSite :: struct {
+    file   : str;
+    line   : u32;
+    column : u32;
 }

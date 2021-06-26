@@ -71,7 +71,7 @@ static const char* token_type_names[] = {
     "true",
     "false",
 
-    "NOTE"
+    "NOTE",
 
     "TOKEN_TYPE_COUNT"
 };
@@ -92,6 +92,8 @@ static const char* token_type_names[] = {
 #endif
 
 #define char_is_alphanum(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || ((c) >= '0' && (c) <= '9'))
+#define char_is_num(c)      ((c) >= '0' && (c) <= '9')
+#define char_is_alpha(c)    (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z'))
 
 static inline b32 token_lit(OnyxTokenizer* tokenizer, OnyxToken* tk, char* lit, b32 is_word, TokenType type) {
     i64 len = 0;
@@ -283,13 +285,7 @@ whitespace_skipped:
             if (*tokenizer->curr == '.') hit_decimal = 1;
         }
 
-       if (!hit_decimal && *(tokenizer->curr + 1) == 'l') {
-            tk.type = Token_Type_Literal_Integer;
-
-            len++;
-            INCREMENT_CURR_TOKEN(tokenizer);
-        }
-        else if (*(tokenizer->curr + 1) == 'f') {
+        if (*(tokenizer->curr + 1) == 'f') {
             tk.type = Token_Type_Literal_Float;
 
             len++;
@@ -392,15 +388,39 @@ whitespace_skipped:
         LITERAL_TOKEN("|=",          0, Token_Type_Or_Equal);
         break;
 
-    default:
+    case '=':
         LITERAL_TOKEN("==",          0, Token_Type_Equal_Equal);
+        break;
+
+    case '!':
         LITERAL_TOKEN("!=",          0, Token_Type_Not_Equal);
+        break;
+
+    case '+':
         LITERAL_TOKEN("+=",          0, Token_Type_Plus_Equal);
+        break;
+
+    case '*':
         LITERAL_TOKEN("*=",          0, Token_Type_Star_Equal);
+        break;
+
+    case '^':
         LITERAL_TOKEN("^=",          0, Token_Type_Xor_Equal);
+        break;
+
+    case '/':
         LITERAL_TOKEN("/=",          0, Token_Type_Fslash_Equal);
+        break;
+
+    case '%':
         LITERAL_TOKEN("%=",          0, Token_Type_Percent_Equal);
+        break;
+
+    case '.':
         LITERAL_TOKEN("..",          0, Token_Type_Dot_Dot);
+        break;
+
+    case '~':
         LITERAL_TOKEN("~~",          0, Token_Type_Tilde_Tilde);
         break;
     }
@@ -442,7 +462,7 @@ OnyxTokenizer onyx_tokenizer_create(bh_allocator allocator, bh_file_contents *fc
         .tokens         = NULL,
     };
 
-    bh_arr_new(allocator, tknizer.tokens, 1 << 16);
+    bh_arr_new(allocator, tknizer.tokens, 1 << 12);
     return tknizer;
 }
 

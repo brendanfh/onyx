@@ -18,7 +18,7 @@
     NODE(Argument)             \
     NODE(AddressOf)            \
     NODE(Dereference)          \
-    NODE(ArrayAccess)          \
+    NODE(Subscript)            \
     NODE(FieldAccess)          \
     NODE(UnaryFieldAccess)     \
     NODE(SizeOf)               \
@@ -30,7 +30,6 @@
     NODE(Compound)             \
                                \
     NODE(DirectiveSolidify)    \
-    NODE(StaticIf)             \
     NODE(DirectiveError)       \
     NODE(DirectiveAddOverload) \
     NODE(DirectiveOperator)    \
@@ -81,6 +80,9 @@
     NODE(SolidifiedFunction)   \
     NODE(PolyProc)             \
                                \
+    NODE(Note)                 \
+    NODE(CallSite)             \
+                               \
     NODE(Package)          
 
 #define NODE(name) typedef struct Ast ## name Ast ## name;
@@ -110,7 +112,6 @@ typedef enum AstKind {
     Ast_Kind_Overloaded_Function,
     Ast_Kind_Polymorphic_Proc,
     Ast_Kind_Block,
-    Ast_Kind_Local_Group,
     Ast_Kind_Local,
     Ast_Kind_Global,
     Ast_Kind_Symbol,
@@ -151,7 +152,7 @@ typedef enum AstKind {
     Ast_Kind_Return,
     Ast_Kind_Address_Of,
     Ast_Kind_Dereference,
-    Ast_Kind_Array_Access,
+    Ast_Kind_Subscript,
     Ast_Kind_Slice,
     Ast_Kind_Field_Access,
     Ast_Kind_Unary_Field_Access,
@@ -179,6 +180,9 @@ typedef enum AstKind {
     Ast_Kind_Directive_Add_Overload,
     Ast_Kind_Directive_Operator,
     Ast_Kind_Directive_Export,
+    Ast_Kind_Call_Site,
+
+    Ast_Kind_Note,
 
     Ast_Kind_Count
 } AstKind;
@@ -230,6 +234,12 @@ typedef enum AstFlags {
     Ast_Flag_Incomplete_Body       = BH_BIT(24),
 
     Ast_Flag_Array_Literal_Typed   = BH_BIT(25),
+
+    Ast_Flag_Has_Been_Symres       = BH_BIT(26),
+
+    Ast_Flag_Has_Been_Checked      = BH_BIT(27),
+
+    Ast_Flag_Static_If_Resolved    = BH_BIT(28),
 } AstFlags;
 
 typedef enum UnaryOp {
@@ -282,6 +292,8 @@ typedef enum BinaryOp {
     Binary_Op_Pipe            = 33,
     Binary_Op_Range           = 34,
     Binary_Op_Method_Call     = 35,
+
+    Binary_Op_Subscript       = 36,
 
     Binary_Op_Count
 } BinaryOp;
@@ -470,6 +482,7 @@ struct Arguments {
     AstKind kind;             \
     u32 flags;                \
     OnyxToken *token;         \
+    struct Entity* entity;    \
     AstNode *next
 struct AstNode { AstNode_base; };
 
@@ -500,10 +513,22 @@ struct AstLocal         { AstTyped_base; };
 struct AstArgument      { AstTyped_base; AstTyped *value; VarArgKind va_kind; b32 is_baked : 1; };
 struct AstAddressOf     { AstTyped_base; AstTyped *expr; };
 struct AstDereference   { AstTyped_base; AstTyped *expr; };
-struct AstArrayAccess   { AstTyped_base; AstTyped *addr; AstTyped *expr; u64 elem_size; };
-struct AstFieldAccess   { AstTyped_base; AstTyped *expr; u32 offset; u32 idx; char* field; }; // If token is null, defer to field
 struct AstSizeOf        { AstTyped_base; AstType *so_ast_type; Type *so_type; u64 size; };
 struct AstAlignOf       { AstTyped_base; AstType *ao_ast_type; Type *ao_type; u64 alignment; };
+struct AstSubscript   {
+    AstTyped_base;
+    BinaryOp __unused_operation; // This will be set to Binary_Op_Subscript
+    AstTyped *addr;
+    AstTyped *expr;
+    u64 elem_size;
+};
+struct AstFieldAccess   {
+    AstTyped_base;
+    AstTyped *expr;
+    u32 offset;
+    u32 idx;
+    char* field; // If token is null, defer to field
+};
 struct AstFileContents  {
     AstTyped_base;
 
@@ -626,7 +651,14 @@ struct AstIfWhile {
 
     AstBlock *true_stmt;
     AstBlock *false_stmt;
+
+    // Used by Static_If
+    bh_arr(struct Entity *) true_entities;
+    bh_arr(struct Entity *) false_entities;
 };
+typedef struct AstIfWhile AstIf;
+typedef struct AstIfWhile AstWhile;
+
 struct AstSwitchCase {
     // NOTE: All expressions that end up in this block
     bh_arr(AstTyped *) values;
@@ -656,14 +688,17 @@ struct AstSwitch {
 // without the 'next' member. This is because types
 // can't be in expressions so a 'next' thing
 // doesn't make sense.
-#define AstType_base    \
-    AstKind kind;       \
-    u32 flags;          \
-    OnyxToken* token;   \
-    char* name
+#define AstType_base       \
+    AstKind kind;          \
+    u32 flags;             \
+    OnyxToken* token;      \
+    struct Entity* entity; \
+    char* name;            \
+    void* __unused;        \
+    Type* type
 struct AstType { AstType_base; };
 
-struct AstBasicType     { AstType_base; Type* type; };
+struct AstBasicType     { AstType_base; Type* basic_type; };
 struct AstPointerType   { AstType_base; AstType* elem; };
 struct AstFunctionType  { AstType_base; AstType* return_type; u64 param_count; AstType* params[]; };
 struct AstArrayType     { AstType_base; AstType* elem; AstTyped *count_expr; };
@@ -684,6 +719,11 @@ struct AstStructType {
     
     // NOTE: Used to store statically bound expressions in the struct.
     Scope* scope;
+
+    struct Entity* entity_type;
+    struct Entity* entity_defaults;
+
+    b32 stcache_is_valid : 1;
 };
 struct AstStructMember {
     AstTyped_base;
@@ -786,12 +826,25 @@ struct AstFunction {
             OnyxToken* foreign_name;
         };
     };
+
+    struct Entity* entity_header;
+    struct Entity* entity_body;
+};
+
+typedef struct OverloadOption OverloadOption;
+struct OverloadOption {
+    // This is u64 because padding will make it that anyway.
+    // Consider: would there be any practical benefit to having the precedence setting
+    // be a compile-time known value? as opposed to a hardcoded value?
+    u64 precedence;
+
+    AstTyped* option;
 };
 
 struct AstOverloadedFunction {
     AstTyped_base;
 
-    bh_arr(AstTyped *) overloads;
+    bh_arr(OverloadOption) overloads;
     
     // CLEANUP: This is unused right now, but should be used to cache
     // the complete set of overloads that can be used by an overloaded
@@ -882,15 +935,6 @@ struct AstPolyProc {
 };
 
 
-struct AstStaticIf {
-    AstNode_base;
-
-    AstTyped* cond;
-
-    bh_arr(struct Entity *) true_entities;
-    bh_arr(struct Entity *) false_entities;
-};
-
 struct AstDirectiveError {
     AstNode_base;
 
@@ -904,6 +948,8 @@ struct AstDirectiveAddOverload {
     // then resolved to an overloaded function.
     AstNode *overloaded_function;
 
+    // See note in OverloadOption. This could be refactored into an OverloadOption?
+    u64 precedence;
     AstTyped *overload;
 };
 
@@ -921,14 +967,26 @@ struct AstDirectiveExport {
     AstTyped* export;
 };
 
+struct AstNote {
+    AstNode_base;
+};
+
+struct AstCallSite {
+    AstTyped_base;
+
+    OnyxToken* callsite_token;
+
+    AstStrLit* filename;
+    AstNumLit* line;
+    AstNumLit* column;
+};
+
 typedef enum EntityState {
     Entity_State_Error,
     
     Entity_State_Parse_Builtin,
     Entity_State_Introduce_Symbols,
     Entity_State_Parse,
-    Entity_State_Comptime_Resolve_Symbols,
-    Entity_State_Comptime_Check_Types,
     Entity_State_Resolve_Symbols,
     Entity_State_Check_Types,
     Entity_State_Code_Gen,
@@ -945,6 +1003,7 @@ typedef enum EntityType {
     Entity_Type_Unknown,
 
     Entity_Type_Error,
+    Entity_Type_Note,
     Entity_Type_Load_Path,
     Entity_Type_Load_File,
     Entity_Type_Binding,
@@ -979,8 +1038,8 @@ typedef struct Entity {
     EntityState state;
 
     // TODO: Document this!
-    u16 macro_attempts;
-    u16 micro_attempts;
+    u32 macro_attempts;
+    u32 micro_attempts;
 
     b32 entered_in_queue : 1;
 
@@ -991,7 +1050,7 @@ typedef struct Entity {
         AstDirectiveError     *error;
         AstInclude            *include;
         AstBinding            *binding;
-        AstStaticIf           *static_if;
+        AstIf                 *static_if;
         AstFunction           *function;
         AstOverloadedFunction *overloaded_function;
         AstGlobal             *global;
@@ -1018,7 +1077,7 @@ typedef struct EntityHeap {
 
 void entity_heap_init(EntityHeap* entities);
 void entity_heap_insert_existing(EntityHeap* entities, Entity* e);
-void entity_heap_insert(EntityHeap* entities, Entity e);
+Entity* entity_heap_insert(EntityHeap* entities, Entity e);
 Entity* entity_heap_top(EntityHeap* entities);
 void entity_heap_change_top(EntityHeap* entities, Entity* new_top);
 void entity_heap_remove_top(EntityHeap* entities);
@@ -1067,10 +1126,12 @@ struct CompileOptions {
     bh_allocator allocator;
     CompileAction action;
 
-    u32 verbose_output          : 28;
+    u32 verbose_output          : 2;
     b32 fun_output              : 1;
     b32 print_function_mappings : 1;
     b32 print_static_if_results : 1;
+    b32 print_notes             : 1;
+    b32 no_colors               : 1;
     
     b32 use_post_mvp_features : 1;
 
@@ -1079,6 +1140,7 @@ struct CompileOptions {
     bh_arr(const char *) included_folders;
     bh_arr(const char *) files;
     const char* target_file;
+    const char* documentation_file;
 };
 
 typedef struct Context Context;
@@ -1120,6 +1182,7 @@ extern AstBasicType basic_type_u64;
 extern AstBasicType basic_type_f32;
 extern AstBasicType basic_type_f64;
 extern AstBasicType basic_type_rawptr;
+extern AstBasicType basic_type_type_expr; // :TypeExprHack
 
 extern AstBasicType basic_type_int_unsized;
 extern AstBasicType basic_type_float_unsized;
@@ -1133,9 +1196,6 @@ extern AstBasicType basic_type_f64x2;
 extern AstBasicType basic_type_v128;
 
 
-// :TypeExprHack
-extern AstNode type_expr_symbol;
-
 extern OnyxToken builtin_package_token;
 extern AstNumLit builtin_heap_start;
 extern AstGlobal builtin_stack_top;
@@ -1147,6 +1207,8 @@ extern Type     *builtin_vararg_type_type;
 extern AstTyped *builtin_context_variable;
 extern AstType  *builtin_allocator_type;
 extern AstType  *builtin_iterator_type;
+extern AstType  *builtin_callsite_type;
+extern AstTyped *type_table_node;
 
 typedef struct BuiltinSymbol {
     char*    package;
@@ -1163,7 +1225,7 @@ typedef struct IntrinsicMap {
 
 extern bh_table(OnyxIntrinsic) intrinsic_table;
 
-extern bh_arr(AstTyped *) operator_overloads[Binary_Op_Count];
+extern bh_arr(OverloadOption) operator_overloads[Binary_Op_Count];
 
 void initialize_builtins(bh_allocator a);
 void introduce_build_options(bh_allocator a);
@@ -1206,6 +1268,8 @@ void arguments_remove_baked(Arguments* args);
 // GROSS: Using void* to avoid having to cast everything.
 const char* node_get_type_name(void* node);
 
+b32 static_if_resolution(AstIf* static_if);
+
 typedef enum PolyProcLookupMethod {
     PPLM_By_Arguments,
     PPLM_By_Function_Type,
@@ -1215,8 +1279,9 @@ AstFunction* polymorphic_proc_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) 
 AstNode* polymorphic_proc_try_solidify(AstPolyProc* pp, bh_arr(AstPolySolution) slns, OnyxToken* tkn);
 AstFunction* polymorphic_proc_build_only_header(AstPolyProc* pp, PolyProcLookupMethod pp_lookup, ptr actual);
 
-AstTyped* find_matching_overload_by_arguments(bh_arr(AstTyped *) overloads, Arguments* args);
-AstTyped* find_matching_overload_by_type(bh_arr(AstTyped *) overloads, Type* type);
+void add_overload_option(bh_arr(OverloadOption)* poverloads, u64 precedence, AstTyped* overload);
+AstTyped* find_matching_overload_by_arguments(bh_arr(OverloadOption) overloads, Arguments* args);
+AstTyped* find_matching_overload_by_type(bh_arr(OverloadOption) overloads, Type* type);
 void report_unable_to_match_overload(AstCall* call);
 
 AstStructType* polymorphic_struct_lookup(AstPolyStructType* ps_type, bh_arr(AstPolySolution) slns, OnyxFilePos pos);
@@ -1227,7 +1292,7 @@ static inline b32 is_lval(AstNode* node) {
         || (node->kind == Ast_Kind_Param)
         || (node->kind == Ast_Kind_Global)
         || (node->kind == Ast_Kind_Dereference)
-        || (node->kind == Ast_Kind_Array_Access)
+        || (node->kind == Ast_Kind_Subscript)
         || (node->kind == Ast_Kind_Field_Access)
         || (node->kind == Ast_Kind_Memres))
         return 1;
