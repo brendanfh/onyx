@@ -2,7 +2,7 @@
 #include "utils.h"
 #include "astnodes.h"
 #include "wasm.h"
-#include "wasmer.h"
+// #include "wasmer.h"
 #include "onyx_library.h"
 
 #ifdef _BH_LINUX
@@ -171,6 +171,7 @@ static void onyx_print_trap(wasm_trap_t* trap) {
     wasm_trap_message(trap, &msg);
     bh_printf("TRAP: %b\n", msg.data, msg.size);
 
+/*
     i32 func_name_section = 0;
 
     i32 cursor = 8; // skip the magic number and version
@@ -204,6 +205,7 @@ static void onyx_print_trap(wasm_trap_t* trap) {
 
         bh_printf("    func[%d]:%p at %s\n", func_idx, mod_offset, func_name);
     }
+    */
 }
 
 // Returns 1 if successful
@@ -215,27 +217,12 @@ b32 onyx_run_wasm(bh_buffer wasm_bytes, int argc, char *argv[]) {
     bh_arr_new(bh_heap_allocator(), linkable_functions, 4);
     onyx_lookup_and_load_custom_libraries(wasm_bytes);
 
-    // void wasm_runtime_init();
-    // wasm_runtime_init();
+    void wasm_runtime_init();
+    wasm_runtime_init();
 
-    wasmer_features_t* features = NULL;
     wasm_trap_t* run_trap = NULL;
 
-    wasm_config = wasm_config_new();
-    if (!wasm_config) goto error_handling;
-
-    // Prefer the LLVM compile because it is faster. This should be configurable from the command line and/or a top-level directive.
-    if (wasmer_is_compiler_available(LLVM)) {
-        wasm_config_set_compiler(wasm_config, LLVM);
-    }
-
-    features = wasmer_features_new();
-    wasmer_features_simd(features, 1);
-    wasmer_features_threads(features, 1);
-    wasmer_features_bulk_memory(features, 1);
-    wasm_config_set_features(wasm_config, features);
-
-    wasm_engine = wasm_engine_new_with_config(wasm_config);
+    wasm_engine = wasm_engine_new();
     if (!wasm_engine) goto error_handling;
 
     wasm_store  = wasm_store_new(wasm_engine);
@@ -252,9 +239,8 @@ b32 onyx_run_wasm(bh_buffer wasm_bytes, int argc, char *argv[]) {
     wasm_module_imports(wasm_module, &module_imports);
 
     wasm_imports = (wasm_extern_vec_t) WASM_EMPTY_VEC;
-    // wasm_imports.data = malloc(module_imports.size * 64);
-    // wasm_imports.size = module_imports.size;
-    wasm_extern_vec_new_uninitialized(&wasm_imports, module_imports.size); // @Free
+    wasm_imports.data = malloc(module_imports.size * 64);
+    wasm_imports.size = module_imports.size;
 
     fori (i, 0, (i32) module_imports.size) {
         const wasm_name_t* module_name = wasm_importtype_module(module_imports.data[i]);
@@ -350,10 +336,6 @@ b32 onyx_run_wasm(bh_buffer wasm_bytes, int argc, char *argv[]) {
 
 error_handling:
     bh_printf("An error occured trying to run the WASM module...\n");
-    i32 len = wasmer_last_error_length();
-    char *buf = alloca(len + 1);
-    wasmer_last_error_message(buf, len);
-    bh_printf("%b\n", buf, len);
 
 cleanup:
     if (wasm_instance) wasm_instance_delete(wasm_instance);

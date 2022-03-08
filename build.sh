@@ -20,13 +20,13 @@ sudo cp -r ./core/ "$CORE_DIR"
 
 [ "$1" = "libs_only" ] && exit 0
 
-if [ ! -f "$CORE_DIR/lib/libwasmer.so" ]; then
+if [ ! -f "$CORE_DIR/lib/libiwasm.so" ]; then
     sudo mkdir -p "$CORE_DIR/lib"
 
-    echo "Copying libwasmer to $CORE_DIR/lib (first install)"
-    # sudo cp "$WASMER_LIBRARY_DIR/libiwasm.so" "$CORE_DIR/lib/libiwasm.so"
-    sudo cp "$WASMER_LIBRARY_DIR/libwasmer.so" "$CORE_DIR/lib/libwasmer.so"
-    sudo cp "$WASMER_LIBRARY_DIR/libwasmer.a" "$CORE_DIR/lib/libwasmer.a"
+    echo "Copying libiwasm to $CORE_DIR/lib (first install)"
+    sudo cp "$WASMER_LIBRARY_DIR/libiwasm.so" "$CORE_DIR/lib/libiwasm.so"
+    # sudo cp "$WASMER_LIBRARY_DIR/libwasmer.so" "$CORE_DIR/lib/libwasmer.so"
+    # sudo cp "$WASMER_LIBRARY_DIR/libwasmer.a" "$CORE_DIR/lib/libwasmer.a"
 fi
 
 C_FILES="onyx astnodes builtins checker clone doc entities errors lex parser symres types utils wasm_emit"
@@ -46,7 +46,7 @@ fi
 
 C_FILES="$C_FILES wasm_runtime"
 FLAGS="$FLAGS -DENABLE_RUN_WITH_WASMER"
-LIBS="-L$CORE_DIR/lib -lwasmer -Wl,-rpath=$CORE_DIR/lib:./ -lpthread -ldl"
+LIBS="-L$CORE_DIR/lib -liwasm -Wl,-rpath=$CORE_DIR/lib:./ -lpthread -ldl"
 INCLUDES="-I$WASMER_INCLUDE_DIR"
 
 mkdir -p "$BUILD_DIR"
