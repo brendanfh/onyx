@@ -141,7 +141,7 @@
         "@vscode/debugadapter": "^1.57.0",
         "await-notify": "^1.0.1",
         "vscode-languageclient": "^8.0.2",
-        "vscode-textmate-languageservice": "0.2.1"
+        "vscode-textmate-languageservice": "1.1.0"
     },
     "devDependencies": {
         "@types/vscode": "^1.1.37",
